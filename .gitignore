@@ -1,0 +1,20 @@
+# secrets
+server/config.json
+.env
+.env.*
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# generated
+*.log
+server/reports/
+server/monitor_data/
+
+# os
+.DS_Store
+Thumbs.db

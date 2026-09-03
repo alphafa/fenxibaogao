@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "三笙商品详情采集",
+  "version": "9.2.5",
+  "description": "跨类目解析商品标题、主图、详情、活动、SKU、动态参数、评论与问答。",
+  "permissions": ["activeTab", "scripting", "tabs", "alarms", "cookies"],
+  "host_permissions": [
+    "http://127.0.0.1:3300/*",
+    "http://localhost:3300/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://*.taobao.com/*",
+    "https://item.jd.com/*",
+    "https://*.jd.com/*",
+    "https://item.taobao.com/*",
+    "https://detail.tmall.com/*",
+    "https://*.tmall.com/*"
+  ],
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1/*", "http://localhost/*"],
+    "js": ["page_bridge.js"],
+    "run_at": "document_start"
+  }],
+  "background": { "service_worker": "service_worker.js" },
+  "action": { "default_title": "重新采集当前商品页" }
+}

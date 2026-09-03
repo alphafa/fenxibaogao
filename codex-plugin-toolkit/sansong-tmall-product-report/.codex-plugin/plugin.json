@@ -1,0 +1,23 @@
+{
+  "name": "sansong-tmall-product-report",
+  "version": "9.0.0",
+  "description": "三笙跨类目电商商品采集、分析、开品与AI视觉报告插件。",
+  "author": {
+    "name": "三笙市场洞察"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "三笙电商商品分析报告",
+    "shortDescription": "跨类目采集商品证据并输出图文开品报告。",
+    "longDescription": "根据类目、标题、主图、详情、SKU、参数、评论与问答动态生成有证据链的电商商品分析报告、新品设计方案和AI视觉参数。",
+    "developerName": "三笙市场洞察",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Analysis", "Reporting"],
+    "brandColor": "#00AFC5",
+    "defaultPrompt": [
+      "基于最新采集生成商品分析报告",
+      "检查商品字段采集是否完整",
+      "输出下一款开品卖点与落地方案"
+    ]
+  }
+}
