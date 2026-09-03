@@ -2,7 +2,7 @@
 body{width:360px;margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5faf9;color:#10191d}h1{font-size:18px;margin:0 0 6px;background:linear-gradient(110deg,#00d9b6,#008bd8);-webkit-background-clip:text;color:transparent}.sub{font-size:12px;color:#60757c;line-height:1.6}.card{margin-top:14px;padding:14px;background:#fff;border:1px solid #dbe8e8;border-radius:14px}.state{font-weight:800;margin-bottom:8px}.bar{height:6px;background:#e6f0ef;border-radius:8px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(110deg,#00d9b6,#008bd8);width:0}.btn{width:100%;margin-top:12px;border:0;background:linear-gradient(110deg,#00cdb0,#008fd8);color:#fff;padding:11px;border-radius:999px;font-weight:800;cursor:pointer}.secondary{background:#fff;color:#17434b;border:1px solid #a9cfcc}.tiny{font-size:11px;color:#71858a;margin-top:9px}.monitor{display:flex;gap:8px}.monitor .btn{flex:1}.ok{color:#008b78}.warn{color:#a66d18}.file{display:none}.live{margin-top:10px;padding:10px;background:#edf9f7;border-radius:10px;font-size:11px;line-height:1.6;color:#526a70}.live strong{font-size:12px;color:#10191d}.live-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;margin-top:6px}.live-preview{margin-top:7px;padding-top:7px;border-top:1px solid #d6e8e5;max-height:78px;overflow:auto}.stop{background:#a83f49!important;color:#fff!important;border:0!important}
 
 .analysis-now{background:#fff;color:#1f1d1a;border:1px solid #1f1d1a}
-.mode-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.mode-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
 .mode{padding:10px;border:1px solid #ded7ce;border-radius:12px;background:#fff;cursor:pointer;font-size:12px}
 .mode.active{background:#1f1d1a;color:#fff;border-color:#1f1d1a}
 .mode small{display:block;opacity:.72;margin-top:4px;line-height:1.45}
@@ -16,7 +16,6 @@ body{width:360px;margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemF
 <h1>三笙 · 电商商品分析引擎</h1>
 <div class="sub">采集当前商品后自动识别类目和分析维度，生成标题、主图、详情、SKU、评论、新品设计与 AI 视觉报告。</div>
 <div class="card"><div id="server" class="state">检查本地服务…</div><div id="status" class="sub">等待当前商品页</div><div class="bar"><i id="bar"></i></div></div>
-<div class="card"><div class="state">当前商品监测数据</div><div id="monitorStatus" class="sub">未检测</div><div class="monitor"><button class="btn secondary" id="importMonitor">添加监测数据</button><button class="btn secondary" id="clearMonitor">清除</button></div><input class="file" id="monitorFile" type="file" accept=".xlsx,.csv,.json"></div>
 <button class="btn" id="run">开始深度采集</button>
 <button class="btn stop" id="stop" style="display:none">终止采集并保存进度</button>
 
@@ -29,15 +28,16 @@ body{width:360px;margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemF
 </div>
 <div id="reviewLive" class="live" style="display:none"><strong>评论实时采集</strong><div class="live-grid"><span>去重：<b id="liveCount">0</b></span><span>网络对象：<b id="liveNet">0</b></span><span>当前轮次：<b id="liveRound">0</b></span><span>无新增：<b id="liveStagnant">0</b></span><span>模式：<b id="liveMode">—</b></span><span>耗时：<b id="liveElapsed">0s</b></span></div><div id="livePreview" class="live-preview">等待评论数据…</div></div>
 <button class="btn secondary" id="open">打开本地服务</button>
-<div class="tiny">不会自动采集；不会采集推荐商品。完整采集模式会继续采到可确认末页；快速分析可随时使用当前已采数据生成报告。</div>
+<div class="tiny">不会采集推荐商品。评论会自动去重、分类和抽样；采集过程中可随时停止并继续。</div>
 <div class="card">
   <div class="state">分析方式</div>
   <div class="mode-row">
-    <button id="modeQuick" class="mode active">快速分析<small>当前已采数据即可开始</small></button>
-    <button id="modeFull" class="mode">完整采集<small>继续采到可确认末页</small></button>
+    <button id="modeQuick" class="mode">快速看结论<small>最多 300 条，约 1 分钟</small></button>
+    <button id="modeStandard" class="mode active">标准采集<small>最多 800 条，适合大多数商品</small></button>
+    <button id="modeFull" class="mode">完整采集<small>尽可能采到末页，耗时较长</small></button>
   </div>
-  <button id="analyzeNow" class="btn analysis-now">基于当前数据开始分析</button>
-  <div class="tiny">分析不会清空采集进度。评论可继续采；报告会明确标注当前评论数量与完整性。</div>
+  <button id="analyzeNow" class="btn analysis-now">先看当前结论</button>
+  <div class="tiny">系统优先保留差评、带图、最新评论和不同主题评论。</div>
 </div>
 <script src="popup.js"></script>
 </body></html>

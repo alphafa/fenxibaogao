@@ -1,7 +1,7 @@
 const SERVER='http://127.0.0.1:17962';
 const EXPECTED_SERVER_VERSION='9.2.5';
 let backendCompatible=false;
-const server=document.getElementById('server'),status=document.getElementById('status'),bar=document.getElementById('bar'),monitorStatus=document.getElementById('monitorStatus'),runBtn=document.getElementById('run'),stopBtn=document.getElementById('stop'),reviewLive=document.getElementById('reviewLive'),liveCount=document.getElementById('liveCount'),liveNet=document.getElementById('liveNet'),liveRound=document.getElementById('liveRound'),liveStagnant=document.getElementById('liveStagnant'),liveMode=document.getElementById('liveMode'),liveElapsed=document.getElementById('liveElapsed'),livePreview=document.getElementById('livePreview');
+const server=document.getElementById('server'),status=document.getElementById('status'),bar=document.getElementById('bar'),runBtn=document.getElementById('run'),stopBtn=document.getElementById('stop'),reviewLive=document.getElementById('reviewLive'),liveCount=document.getElementById('liveCount'),liveNet=document.getElementById('liveNet'),liveRound=document.getElementById('liveRound'),liveStagnant=document.getElementById('liveStagnant'),liveMode=document.getElementById('liveMode'),liveElapsed=document.getElementById('liveElapsed'),livePreview=document.getElementById('livePreview');
 const paramLive=document.getElementById('paramLive'),paramState=document.getElementById('paramState'),paramCount=document.getElementById('paramCount'),paramTags=document.getElementById('paramTags'),paramMissing=document.getElementById('paramMissing');
 async function active(){return (await chrome.tabs.query({active:true,currentWindow:true}))[0]}
 function itemIdFromUrl(u){try{return new URL(u).searchParams.get('id')||((u||'').match(/[?&]id=(\d+)/)||[])[1]||''}catch(e){return''}}
@@ -19,7 +19,7 @@ async function refresh(){
    server.className='state ok';
  }
  const t=await active(); if(!t)return; const id=itemIdFromUrl(t.url||'');
- if(!id){status.textContent='请打开天猫/淘宝商品详情页';monitorStatus.textContent='当前页面未识别商品ID';return}
+ if(!id){status.textContent='请打开天猫/淘宝商品详情页';return}
  const k='status_'+t.id; const d=(await chrome.storage.local.get(k))[k];
  if(d){status.textContent=d.message||d.state;bar.style.width=(d.progress||0)+'%';runBtn.textContent=(d.state==='reviews_incomplete'||d.state==='reviews_stopped')?'继续采集评论':'开始深度采集';const lp=d.reviewLive;const activeCollect=d.state==='collecting'||d.state==='collecting_reviews';stopBtn.style.display=activeCollect?'block':'none';reviewLive.style.display=(lp||activeCollect||d.state==='reviews_incomplete'||d.state==='reviews_stopped')?'block':'none';const ps=d.parameterStatus;
    paramLive.style.display=ps?'block':'none';
@@ -30,14 +30,14 @@ async function refresh(){
      paramMissing.textContent='缺失项：'+((ps.missing||[]).length?(ps.missing.join('、')):'无');
    }
    if(lp){liveCount.textContent=lp.count??0;liveNet.textContent=lp.networkReviewObjects??0;liveRound.textContent=lp.round??0;liveStagnant.textContent=lp.stagnant??0;liveMode.textContent=lp.mode||'—';liveElapsed.textContent=Math.round((lp.elapsedMs||0)/1000)+'s';livePreview.innerHTML=(lp.preview||[]).map((x,i)=>`<div>${i+1}. ${String(x).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`).join('')||'等待评论数据…'}}else{status.textContent='已识别当前商品，等待手动开始。';bar.style.width='0%';runBtn.textContent='开始深度采集';stopBtn.style.display='none';reviewLive.style.display='none'}
- try{const r=await fetch(`${SERVER}/api/monitor/${encodeURIComponent(id)}`);const j=await r.json();monitorStatus.textContent=j.ok&&j.days?`已导入 ${j.days} 天 · ${j.firstSales||'—'} → ${j.lastSales||'—'}`:'未导入（可选）'}catch(e){monitorStatus.textContent='本地服务启动后可导入'}
 }
+let collectionMode='standard';
 runBtn.onclick=async()=>{
  if(!backendCompatible){status.textContent='插件与本地后端版本不一致，请先双击本包“start-tmall-ai.command”';return}
- const t=await active();status.textContent='开始采集当前商品…';try{const r=await chrome.runtime.sendMessage({type:'RUN_CURRENT',tabId:t.id});if(r?.needsReviewResume){status.textContent=r.message||'评论还没到末页，请继续采集';runBtn.textContent='继续采集评论'}else if(!r?.ok){status.textContent='采集失败：'+(r?.error||'未知错误')}}catch(e){status.textContent='采集失败：'+String(e)}setTimeout(refresh,500)};
+ const t=await active();status.textContent='开始采集当前商品…';try{const r=await chrome.runtime.sendMessage({type:'RUN_CURRENT',tabId:t.id,collectionMode});if(r?.needsReviewResume){status.textContent=r.message||'评论还没到末页，请继续采集';runBtn.textContent='继续采集评论'}else if(!r?.ok){status.textContent='采集失败：'+(r?.error||'未知错误')}}catch(e){status.textContent='采集失败：'+String(e)}setTimeout(refresh,500)};
 document.getElementById('open').onclick=()=>chrome.tabs.create({url:SERVER+'/'});
-document.getElementById('importMonitor').onclick=()=>document.getElementById('monitorFile').click();
-document.getElementById('monitorFile').onchange=async e=>{
+document.getElementById('importMonitor')?.addEventListener('click',()=>document.getElementById('monitorFile')?.click());
+document.getElementById('monitorFile')?.addEventListener('change',async e=>{
  const f=e.target.files?.[0];if(!f)return;
  if(!backendCompatible){monitorStatus.textContent='导入失败：插件与后端版本不一致，请启动本包最新服务';e.target.value='';return}
  const t=await active();const itemId=itemIdFromUrl(t?.url||'');
@@ -74,29 +74,33 @@ document.getElementById('monitorFile').onchange=async e=>{
    monitorStatus.textContent='导入失败：'+String(err);
  }
  e.target.value='';
-};
-document.getElementById('clearMonitor').onclick=async()=>{const t=await active();const itemId=itemIdFromUrl(t?.url||'');if(!itemId)return;try{await fetch(SERVER+'/api/monitor-clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({itemId})});monitorStatus.textContent='已清除'}catch(e){monitorStatus.textContent='清除失败'}};
+});
+document.getElementById('clearMonitor')?.addEventListener('click',async()=>{});
 refresh();setInterval(refresh,1300);
 
 stopBtn.onclick=async()=>{const t=await active();stopBtn.disabled=true;stopBtn.textContent='正在终止…';try{const r=await chrome.runtime.sendMessage({type:'STOP_COLLECTION',tabId:t?.id});status.textContent=r?.ok?'已发送终止指令，正在保存当前进度…':'终止失败，请重试'}catch(e){status.textContent='终止失败：'+String(e)}setTimeout(()=>{stopBtn.disabled=false;stopBtn.textContent='终止采集并保存进度'},1000)};
 
 const analyzeNow=document.getElementById('analyzeNow');
 const modeQuick=document.getElementById('modeQuick');
+const modeStandard=document.getElementById('modeStandard');
 const modeFull=document.getElementById('modeFull');
-let analysisMode='quick';
+let analysisMode='standard';
 
 function setMode(mode){
   analysisMode=mode;
+  collectionMode=mode;
   modeQuick?.classList.toggle('active',mode==='quick');
+  modeStandard?.classList.toggle('active',mode==='standard');
   modeFull?.classList.toggle('active',mode==='full');
   if(analyzeNow){
-    analyzeNow.textContent=mode==='quick'?'基于当前数据开始分析':'完整采集后自动分析';
-    analyzeNow.disabled=mode==='full';
+    analyzeNow.textContent=mode==='quick'?'先看当前结论':mode==='standard'?'采集并生成报告':'完整采集后自动分析';
+    analyzeNow.disabled=false;
   }
 }
 modeQuick && (modeQuick.onclick=()=>setMode('quick'));
+modeStandard && (modeStandard.onclick=()=>setMode('standard'));
 modeFull && (modeFull.onclick=()=>setMode('full'));
-setMode('quick');
+setMode('standard');
 
 analyzeNow && (analyzeNow.onclick=async()=>{
   if(!backendCompatible){
