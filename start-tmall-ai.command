@@ -1,7 +1,7 @@
 #!/bin/bash
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PORT=17962
-VERSION="9.2.5"
+VERSION="9.3.0"
 SERVER="$ROOT/server"
 LOG="$SERVER/v9_1_0.log"
 

@@ -12,6 +12,7 @@ venv/
 
 # generated
 *.log
+*.zip
 server/reports/
 server/monitor_data/
 

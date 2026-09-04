@@ -16,6 +16,13 @@ body{width:360px;margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemF
 <h1>三笙 · 电商商品分析引擎</h1>
 <div class="sub">采集当前商品后自动识别类目和分析维度，生成标题、主图、详情、SKU、评论、新品设计与 AI 视觉报告。</div>
 <div class="card"><div id="server" class="state">检查本地服务…</div><div id="status" class="sub">等待当前商品页</div><div class="bar"><i id="bar"></i></div></div>
+<div class="card sample-card"><div class="state">采集前先选择评论样本</div><div class="sub">只限制评论样本数量；商品信息、参数、图片、问答和完整分析内容都会保留。</div><div class="mode-row">
+  <button data-sample="50" class="mode">50 条<small>快速判断</small></button>
+  <button data-sample="100" class="mode">100 条<small>常规小样本</small></button>
+  <button data-sample="500" class="mode active">500 条<small>推荐</small></button>
+  <button data-sample="all" class="mode">全部<small>采到可访问末页</small></button>
+  <button data-sample="custom" class="mode">自定义<small>输入数量</small></button>
+</div><div id="customSampleWrap" style="display:none;margin-top:10px"><input id="customSample" type="number" min="1" max="10000" placeholder="输入评论条数（1-10000）"></div><div class="tiny">采集开始后不能切换样本档位；如中途停止，可按原档位继续。</div></div>
 <button class="btn" id="run">开始深度采集</button>
 <button class="btn stop" id="stop" style="display:none">终止采集并保存进度</button>
 
@@ -27,17 +34,8 @@ body{width:360px;margin:0;padding:18px;font-family:-apple-system,BlinkMacSystemF
   <div class="param-miss" id="paramMissing">缺失项：—</div>
 </div>
 <div id="reviewLive" class="live" style="display:none"><strong>评论实时采集</strong><div class="live-grid"><span>去重：<b id="liveCount">0</b></span><span>网络对象：<b id="liveNet">0</b></span><span>当前轮次：<b id="liveRound">0</b></span><span>无新增：<b id="liveStagnant">0</b></span><span>模式：<b id="liveMode">—</b></span><span>耗时：<b id="liveElapsed">0s</b></span></div><div id="livePreview" class="live-preview">等待评论数据…</div></div>
+<div class="card"><div class="state">分析入口</div><div class="sub">已有采集数据时，可直接生成报告；不会清空当前采集进度。</div><button id="analyzeNow" class="btn analysis-now">基于当前数据开始分析</button></div>
 <button class="btn secondary" id="open">打开本地服务</button>
 <div class="tiny">不会采集推荐商品。评论会自动去重、分类和抽样；采集过程中可随时停止并继续。</div>
-<div class="card">
-  <div class="state">分析方式</div>
-  <div class="mode-row">
-    <button id="modeQuick" class="mode">快速看结论<small>最多 300 条，约 1 分钟</small></button>
-    <button id="modeStandard" class="mode active">标准采集<small>最多 800 条，适合大多数商品</small></button>
-    <button id="modeFull" class="mode">完整采集<small>尽可能采到末页，耗时较长</small></button>
-  </div>
-  <button id="analyzeNow" class="btn analysis-now">先看当前结论</button>
-  <div class="tiny">系统优先保留差评、带图、最新评论和不同主题评论。</div>
-</div>
 <script src="popup.js"></script>
 </body></html>

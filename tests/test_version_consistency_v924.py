@@ -2,7 +2,7 @@ import json, re
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-EXPECTED='9.2.5'
+EXPECTED='9.3.0'
 
 def test_version_consistency():
     assert (ROOT/'VERSION.txt').read_text().strip()==EXPECTED

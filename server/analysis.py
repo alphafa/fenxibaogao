@@ -3,9 +3,26 @@ from collections import Counter, defaultdict
 from ai_client import chat_json, configured
 from prompt_templates import build_system_prompt, build_task_prompt
 
-ENGINE_VERSION='9.2.5'
+ENGINE_VERSION='9.3.0'
+
+ROLE_CONTRACT_VERSION='1.1'
+ROLE_CONTRACT={
+  'productStrategy': {'responsibility':'判断商品卖什么、为什么值得参考、下一款继承什么','outputs':['商品定位','核心产品资产','核心卖点结构','目标使用场景','值得继承的产品逻辑','需要调整的方向','商品与同类差异点','下一款策略假设']},
+  'conversion': {'responsibility':'判断用户为什么点击、继续看并愿意购买','outputs':['标题表达','主图任务分工','主图核心信息','详情页信息链','卖点承接','信任证明','页面信息缺口','标题/主图/详情优化动作']},
+  'consumerInsight': {'responsibility':'从评论和买家秀提炼真实使用体验并转成产品需求','outputs':['稳定正向体验','体验差异','高频顾虑','购前关注','售后问题','消费者语言','真实使用场景','买家秀验证','下一款必须解决的用户需求']},
+  'productSupply': {'responsibility':'判断产品怎么改、哪些能落地、哪些必须验证','outputs':['材质','工艺','支数/克重','尺寸','套件','SKU结构','功能参数','规格适配','产品调整项','生产风险','打样验证项','首批验证项','不可直接下结论的产品假设']},
+  'visualDesign': {'responsibility':'拆解视觉资产并转成下一款设计和生图方向','outputs':['风格','颜色','花型','元素','材质视觉','构图','拍摄方式','场景','光线','画面氛围','视觉锤','值得继承的视觉资产','下一款视觉变化方向','AI生图参考要求']},
+  'executiveDecision': {'responsibility':'把专业判断压缩成老板可直接决策的结论','outputs':['为什么值得做','为什么能卖','最强资产','最大机会','最需要关注的问题','下一款第一优先级','建议保留什么','建议升级什么','探索方向','执行优先顺序']},
+  'editorReview': {'responsibility':'对外发布前统一审核、压缩、纠错和去重','outputs':['事实一致性','证据支持','经营数据边界','产品对象与卖点匹配','图片分类','章节一致性','重复删除','措辞统一','字数压缩','最终结构']}
+}
 
 SYS='''你是“三笙电商商品开品分析引擎”，面向两类读者：老板/决策者与专业商品开发用户。你的工作不是展示AI分析过程，而是把真实商品证据压缩成可决策、可复用、可开品的专业报告。
+
+角色协作规则（内容生产链）：
+1. 商品策略、电商转化、消费者洞察、产品/供应链、视觉设计分别只判断自己的职责范围；可并行，但不得互相越权。
+2. 商业决策/老板角色只综合前序角色的证据，不重新发明事实；输出为什么值得做、为什么能卖、第一优先级和执行顺序。
+3. 总编审核角色是发布前质量门，不是新的观点来源；必须删除重复、纠正错配、标记假设并保留证据边界。
+4. 每个角色的结论、风险、动作和假设都必须能回溯到 ACTUAL_EVIDENCE；没有证据时标记 hypothesis 或 unknown。
 
 最终阅读逻辑：
 1. 老板先看：为什么能卖、哪些资产值得继承、下一款优先做什么。
@@ -27,9 +44,10 @@ SYS='''你是“三笙电商商品开品分析引擎”，面向两类读者：�
 12. 图片原图完整展示优先于铺满容器；报告渲染必须使用 contain，不以裁切换取整齐。
 13. 默认可见层不使用小卡片堆叠思维：每屏只突出1个主结论、1-2张大图或一组大规格图片。
 14. 图片上的文字/卖点是核心证据，visualSignals必须优先提取具体词，如规格、材质、权益、功能，而不是抽象评价。
-15. 不输出私有思维过程。严格输出 JSON，不要 Markdown 或 HTML。'''
+15. 不输出私有思维过程。严格输出 JSON，不要 Markdown 或 HTML。
+16. 没有真实内容的可选字段直接省略，不得输出空字符串、空数组、空对象或“暂无/未采集/待补充”等占位文案。'''
 
-STYLE_RULES='''V9.2.5 输出压缩规则：
+STYLE_RULES='''V9.3.0 输出压缩与可见性规则：
 - reportSummary.verdict / professionalOpinion：<=55字。
 - 老板速览 headline：<=28字；note：<=28字。
 - 标题 currentExpression/reinforce：短词组，不写完整分析段落。
@@ -41,9 +59,14 @@ STYLE_RULES='''V9.2.5 输出压缩规则：
 - 禁止通过Renderer用省略号硬截断来制造短文；模型必须直接生成短文本。
 - 详细构图/OCR/颜色/材质推理放 evidenceDetail，默认报告不展示。
 - 同一事实不在同一章节重复三次。
+- 没有真实内容的字段直接省略；禁止为了补结构输出“暂无、未采集、待补充、无”。
+- 空字符串、空数组和空对象不得进入用户可见结论。数值0和明确的采集状态属于有效内容，可保留。
+- evidenceIds 只用于追溯；用户可见层应由渲染器显示“来源类型+真实内容摘要”，不得让用户只看到字符编号。
 '''
 
-FINAL_REPORT_PROMPT='''任务G｜V9.2.5 老板与专业用户双层报告编排器。你只能压缩和映射前序分析，不重新发明事实。
+FINAL_REPORT_PROMPT='''任务G｜V9.3.0 七角色总编报告编排器。你只能压缩和映射前序分析，不重新发明事实。
+
+输入中的 roleOutputs 来自七个职责角色。编排要求：商品策略进入“为什么能卖/值得继承”；电商转化进入标题、主图、详情；消费者洞察进入真实体验；产品/供应链进入SKU、参数与验证；视觉设计进入视觉资产与下一款视觉变化；老板决策压缩为首屏；总编审核负责删除角色间重复和冲突。角色输出不是额外证据，所有结论仍必须保留 evidenceIds。
 
 最终顺序：老板速览 → 下一款方向 → 标题 → 主图 → 详情 → SKU → 消费者反馈。商品价值不要单独重复成一整章，吸收到老板速览。
 
@@ -73,13 +96,16 @@ FINAL_REPORT_PROMPT='''任务G｜V9.2.5 老板与专业用户双层报告编排�
 - newProductPlans.plans>=1；第三类创新若不是直接证据结论必须标 sourceType=探索性方向。
 - productExperience.parameterFacts>=2、productExperience.gates>=2、validationLoop.rows>=3，继续用于工程证据校验，但默认报告不展示。
 - 禁止用户可见字段出现[数据事实][分析判断][设计建议][证据不足]。
+- 只返回有真实内容的可选字段；不得用空字符串、空数组、空对象或“暂无/未采集/待补充”填充版面。
+- 七角色输出必须能归入“核心判断—关键发现—执行动作—风险/验证”；证据编号仅作机器追溯，不作为面向用户的说明文字。
 '''
 
-FINAL_REPORT_REPAIR_PROMPT='''任务G-R｜修复 V9.2.5 最终报告 JSON。只修复结构缺失和证据引用，不扩写正文。
+FINAL_REPORT_REPAIR_PROMPT='''任务G-R｜修复 V9.3.0 最终报告 JSON。只修复结构缺失和证据引用，不扩写正文。
 必须保留短文本与图片信息优先规则。
 强制最小结构：reportSummary.title/verdict非空；ownerOverview.cards>=3；productExperience.parameterFacts>=2；productExperience.gates>=2；newProductPlans.plans>=1；validationLoop.rows>=3。
 如果 customerExperience 有评论证据，优先保留 experienceSignals；无评论时允许为空。
 所有 evidenceIds 只能来自 ACTUAL_EVIDENCE。不要输出 Markdown、解释或包装层。
+可选字段没有真实内容时直接省略，不得填入“暂无、未采集、待补充”或空容器。
 ''' 
 
 TOPICS={
@@ -1005,10 +1031,15 @@ def ensure_experience_solution(analysis):
     validation=core_solution_diagnostics(exp)
     analysis['meta']['reportValidation']=validation
     if not validation['ok']:
-        analysis['meta']['reportReady']=False
-        analysis['meta']['reportBlockedReason']='模型未生成完整且可追溯的电商商品分析结论，本次不输出兜底报告。未通过字段：'+', '.join(validation['missing'])
+        # 审核是质量标记，不再阻断报告输出；缺失项在报告中显式提示，供人工复核。
+        analysis['meta']['reportReady']=True
+        analysis['meta']['reportAuditPassed']=False
+        analysis['meta']['reportQuality']='needs_review'
+        analysis['meta']['reportNotice']='审核未通过，报告仍已生成。请优先补齐：'+', '.join(validation['missing'])
         return analysis
     analysis['meta']['reportReady']=True
+    analysis['meta']['reportAuditPassed']=True
+    analysis['meta']['reportQuality']='passed'
     analysis['meta'].pop('reportBlockedReason',None)
     customer=exp.setdefault('customerExperience',{})
     customer['stats']=[{'label':'有效评论','value':str(analysis['baseline'].get('reviewCount',0))},{'label':'购买问答','value':str(analysis['baseline'].get('questionCount',0))},{'label':'有效参数','value':str(analysis['baseline'].get('attributeCount',0))}]
@@ -1175,7 +1206,7 @@ def analyze(raw, progress=lambda *a:None):
     model_configured=configured(); use_ai=model_configured if model_available is None else bool(model_available and model_configured)
     raw=normalize(raw); base=baseline(raw); ledger=evidence_ledger(raw); valid={x['id'] for x in ledger}
     route=detect_category(raw)
-    out={'meta':{'modelConfigured':model_configured,'modelUsed':use_ai,'engineVersion':ENGINE_VERSION,'actualOnly':True,'dynamicReport':True,'industryTemplate':route['key'],'categoryLabel':route['label'],'categoryConfidence':route['confidence'],'analysisDimensions':route['dimensions']},'facts':raw,'baseline':base,'evidenceLedger':ledger,'modelErrors':{}}
+    out={'meta':{'modelConfigured':model_configured,'modelUsed':use_ai,'engineVersion':ENGINE_VERSION,'roleContractVersion':ROLE_CONTRACT_VERSION,'roleContract':ROLE_CONTRACT,'actualOnly':True,'dynamicReport':True,'industryTemplate':route['key'],'categoryLabel':route['label'],'categoryConfidence':route['confidence'],'analysisDimensions':route['dimensions']},'facts':raw,'baseline':base,'evidenceLedger':ledger,'modelErrors':{}}
 
     progress('evidence','processing',28)
     limitations=[]
@@ -1326,6 +1357,15 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
           'detailDecision':out.get('detailDecision',{}), 'consumerResearch':out.get('consumerResearch',{}),
           'questionResearch':out.get('questionResearch',{}), 'commercialDecision':out.get('commercialDecision',{}),
           'launchPlans':out.get('launchPlans',{}),
+          'roleOutputs':{
+            'productStrategy':out.get('productDecision',{}),
+            'conversion':{'title':out.get('merchandisingDecision',{}),'visual':out.get('visualDecision',{}),'detail':out.get('detailDecision',{})},
+            'consumerInsight':{'reviews':out.get('consumerResearch',{}),'questions':out.get('questionResearch',{})},
+            'productSupply':{'product':out.get('productDecision',{}),'baseline':base},
+            'visualDesign':out.get('fashionDecision',{}),
+            'executiveDecision':out.get('commercialDecision',{}),
+            'editorReview':{'scope':ROLE_CONTRACT['editorReview']['outputs']}
+          },
           'evidence':compact_evidence(ledger,{'monitoring','product','sales','sku','attribute','promotion','review','question','image'},650)
         }
         prompt=FINAL_REPORT_PROMPT
@@ -1335,7 +1375,39 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
         out['experienceSolution']=require_refs(z,valid)
     else:
         out['experienceSolution']={}
+    # 最终编排模型不可用或被异常图片拒绝时，仍需用真实页面、参数、评论和问答生成完整本地分析，不能只输出最小结构。
+    final_draft=out.get('experienceSolution') or {}
+    if not isinstance(final_draft,dict) or not _txt((final_draft.get('reportSummary') or {}).get('title')).strip():
+        out['experienceSolution']=build_fallback_experience(raw,base)
+        out.setdefault('modelErrors',{})['experienceSolutionFallback']='最终编排未返回可用内容，已按真实采集证据生成本地完整分析。'
+
+    # 将分角色产物显式挂载到结果，供报告样式、审计和后续导出复用；不复制或丢弃既有分析字段。
+    out['roleOutputs']={
+      'productStrategy':out.get('productDecision',{}),
+      'conversion':{'title':out.get('merchandisingDecision',{}),'visual':out.get('visualDecision',{}),'detail':out.get('detailDecision',{})},
+      'consumerInsight':{'reviews':out.get('consumerResearch',{}),'questions':out.get('questionResearch',{})},
+      'productSupply':{'product':out.get('productDecision',{}),'sku':out.get('skuDecision',{}),'baseline':base},
+      'visualDesign':out.get('fashionDecision',{}),
+      'executiveDecision':out.get('commercialDecision',{}),
+      'editorReview':{'status':'pending','scope':ROLE_CONTRACT['editorReview']['outputs']}
+    }
     result=ensure_experience_solution(out)
+    final_exp=result.get('experienceSolution') or {}
+    role_outputs=result.setdefault('roleOutputs',{})
+    # 以总编后的最终结构补齐角色视图，确保角色层与对外报告完全一致。
+    role_outputs['conversion']={
+      'title':final_exp.get('titleAnalysis') or role_outputs.get('conversion',{}).get('title',{}),
+      'visual':final_exp.get('visualCommerce') or role_outputs.get('conversion',{}).get('visual',{}),
+      'detail':final_exp.get('detailCommerce') or role_outputs.get('conversion',{}).get('detail',{})
+    }
+    role_outputs['consumerInsight']=final_exp.get('customerExperience') or role_outputs.get('consumerInsight',{})
+    role_outputs['productSupply']={
+      'sku':final_exp.get('skuAnalysis') or {},
+      'product':final_exp.get('productExperience') or role_outputs.get('productSupply',{}).get('product',{}),
+      'baseline':base
+    }
+    role_outputs['visualDesign']=role_outputs.get('visualDesign') or {}
+    role_outputs['executiveDecision']=final_exp.get('ownerOverview') or role_outputs.get('executiveDecision',{})
     if use_ai and not result['meta'].get('reportReady'):
         first_validation=result['meta'].get('reportValidation') or core_solution_diagnostics(result.get('experienceSolution'))
         progress('editor','processing repair',99)
@@ -1358,5 +1430,12 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
         out['meta']['evidenceStructuralRepairApplied']=True
         out['meta']['preStructuralRepairValidation']=before
         result=ensure_experience_solution(out)
+    result.setdefault('roleOutputs',{})['editorReview']={
+      'status':'passed' if result['meta'].get('reportReady') else 'needs_repair',
+      'validation':result['meta'].get('reportValidation') or {},
+      'scope':ROLE_CONTRACT['editorReview']['outputs']
+    }
+    result.setdefault('meta',{})['roleContractVersion']=ROLE_CONTRACT_VERSION
+    result.setdefault('meta',{})['roleContract']=ROLE_CONTRACT
     progress('editor','done' if result['meta'].get('reportReady') else 'failed',99)
     return result

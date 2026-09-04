@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "三笙商品详情采集",
-  "version": "9.2.5",
+  "version": "9.3.0",
   "description": "跨类目解析商品标题、主图、详情、活动、SKU、动态参数、评论与问答。",
   "permissions": ["activeTab", "scripting", "tabs", "alarms", "cookies"],
   "host_permissions": [

@@ -15,6 +15,8 @@ PRODUCT_VARIABLES = {
     "questions": "问大家/购买问答：问题、回答及 QA evidenceId",
     "programStats": "程序统计：评论数量、图片数量、参数数量等可计算指标",
     "evidence": "统一证据账本；模型只能引用其中的 evidenceId",
+    "roleOutputs": "七角色中间结论：商品策略、电商转化、消费者洞察、产品/供应链、视觉设计、老板决策与总编审核；只能交叉校验和编排，不得当作无证据事实",
+    "renderingPolicy": "最终可见性规则：只展示真实非空内容；证据以来源类型和内容摘要呈现，evidenceId仅用于追溯",
 }
 
 @dataclass(frozen=True)

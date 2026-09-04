@@ -13,7 +13,7 @@ PROMPT_CONFIG=ROOT/'prompts.json'
 REPORTS=ROOT/'reports'; REPORTS.mkdir(exist_ok=True)
 MONITOR_DIR=ROOT/'monitor_data'; MONITOR_DIR.mkdir(exist_ok=True)
 PORT=int(os.getenv('TMALL_AI_PORT','17962'))
-SERVER_VERSION='9.2.5'
+SERVER_VERSION='9.3.0'
 MODEL_PROBE={'ok':False,'stage':'startup','error':'尚未检测'}
 MODEL_PROBE_AT=0
 TASKS={}
@@ -346,7 +346,12 @@ def prompt_page():
         try: saved=json.loads(PROMPT_CONFIG.read_text('utf-8'))
         except Exception: saved={}
     items={k:{'name':v.name,'body':saved.get(k,{}).get('body',v.body),'variables':list(v.variables)} for k,v in TEMPLATES.items()}
-    return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>提示词配置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;background:#f5faf9;margin:0}.wrap{max-width:1100px;margin:30px auto;padding:0 20px}.card{background:#fff;border:1px solid #dbe8e8;border-radius:16px;padding:22px;margin:16px 0}textarea{width:100%;min-height:260px;font:14px monospace;padding:12px;border:1px solid #bcd8d6;border-radius:10px}button{background:#008f7a;color:#fff;border:0;border-radius:9px;padding:12px 18px;font-weight:700;cursor:pointer}.vars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.var{background:#eef9f7;padding:10px;border-radius:8px;font-size:13px}</style><div class="wrap"><h1>提示词可视化配置</h1><p>编辑后保存，下一次分析任务生效。</p><section class="card"><h2>商品变量说明</h2><div class="vars">'+Object.entries(PRODUCT_VARIABLES).map(([k,v])=>`<div class="var"><b>${html.escape(k)}</b><br>${html.escape(v)}</div>`).join('')+'</div></section>'+Object.entries(items).map(([k,v])=>`<section class="card"><h2>${html.escape(k)}</h2><p>变量：${html.escape(v.variables.join('、')||'自定义')}</p><textarea data-key="${html.escape(k)}">${html.escape(v.body)}</textarea></section>`).join('')+'<button onclick="save()">保存全部模板</button><span id="msg" style="margin-left:12px"></span></div><script>async function save(){const templates={};document.querySelectorAll("textarea[data-key]").forEach(x=>templates[x.dataset.key]={body:x.value});const r=await fetch("/api/prompts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({templates})});const d=await r.json();document.getElementById("msg").textContent=d.ok?"已保存":"保存失败："+(d.error||"")}</script></html>'
+    vars_html=''.join(f'<div class="var"><b>{html.escape(k)}</b><br>{html.escape(v)}</div>' for k,v in PRODUCT_VARIABLES.items())
+    template_html=''.join(f'<section class="card"><h2>{html.escape(k)}</h2><p>变量：{html.escape("、".join(v["variables"]) or "自定义")}</p><textarea data-key="{html.escape(k)}">{html.escape(v["body"])}</textarea></section>' for k,v in items.items())
+    return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+      '<title>提示词配置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;background:#f5faf9;margin:0}.wrap{max-width:1100px;margin:30px auto;padding:0 20px}.card{background:#fff;border:1px solid #dbe8e8;border-radius:16px;padding:22px;margin:16px 0}textarea{width:100%;min-height:260px;font:14px monospace;padding:12px;border:1px solid #bcd8d6;border-radius:10px}button{background:#008f7a;color:#fff;border:0;border-radius:9px;padding:12px 18px;font-weight:700;cursor:pointer}.vars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.var{background:#eef9f7;padding:10px;border-radius:8px;font-size:13px}</style>'
+      '<div class="wrap"><h1>提示词可视化配置</h1><p>编辑后保存，下一次分析任务生效。</p><section class="card"><h2>商品变量说明</h2><div class="vars">'+vars_html+'</div></section>'+template_html
+      +'<button onclick="save()">保存全部模板</button><span id="msg" style="margin-left:12px"></span></div><script>async function save(){const templates={};document.querySelectorAll("textarea[data-key]").forEach(x=>templates[x.dataset.key]={body:x.value});const r=await fetch("/api/prompts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({templates})});const d=await r.json();document.getElementById("msg").textContent=d.ok?"已保存":"保存失败："+(d.error||"")}</script></html>')
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): print('[HTTP]',fmt%args)
@@ -500,7 +505,7 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     print(f'Sansong Ecommerce Product Loop V{SERVER_VERSION} running: http://127.0.0.1:{PORT}',flush=True)
-    print('Dedicated port 17962. Manual single-product collection; no recommendation scraping.',flush=True)
+    print(f'Dedicated port {PORT}. Manual single-product collection; no recommendation scraping.',flush=True)
     ThreadingHTTPServer(('127.0.0.1',PORT),H).serve_forever()
 if __name__=='__main__': main()
 DYNAMIC_PARAM_FAMILIES = {

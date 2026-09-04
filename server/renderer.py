@@ -1,4 +1,5 @@
 import html
+import json
 import re
 from analysis import ensure_experience_solution
 
@@ -669,18 +670,7 @@ def _plans_v92(exp,a,idx):
 def render(a, task_id):
     a=ensure_experience_solution(a)
     if not (a.get('meta') or {}).get('reportReady'): raise ValueError((a.get('meta') or {}).get('reportBlockedReason') or '本次没有可输出的证据结论')
-    raw=a.get('facts') or {}; product=raw.get('product') or {}; sales=raw.get('sales') or {}; base=a.get('baseline') or {}; exp=a.get('experienceSolution') or {}; idx=evidence_index(a)
-    summary=exp.get('reportSummary') or {}
+    raw=a.get('facts') or {}; product=raw.get('product') or {}; exp=a.get('experienceSolution') or {}; summary=exp.get('reportSummary') or {}
     title=clean_display(summary.get('title') or product.get('title') or '商品分析报告',60)
-    verdict=first_text(summary.get('verdict'),limit=58) or '基于当前商品页面、图片、参数与评论证据形成开品建议。'
-    cover_id=safe(summary.get('coverImageId')); cover_e=idx.get(cover_id) if cover_id else None
-    if not cover_e:
-        mains=_entries(idx,'main',1); cover_e=mains[0][1] if mains else None
-    price='¥'+safe(sales.get('currentPrice')) if safe(sales.get('currentPrice')) else '价格未采集'
-    sold=safe(sales.get('sold') or sales.get('cumulativeSales')) or '销量未采集'
-    meta_line=f'{price} · 公开销量 {sold} · 评论 {base.get("reviewCount",0)} · SKU图 {len(_entries(idx,"sku",999))} · 参数 {base.get("attributeCount",0)}'
-    nav='<nav class="v92-nav"><div class="wrap"><div class="brand">三笙 · 商品开品分析</div><div class="v92-links"><a href="#decision">老板速览</a><a href="#plan">新品方向</a><a href="#title">标题</a><a href="#main">主图</a><a href="#detail">详情</a><a href="#sku">SKU</a><a href="#review">评价</a></div></div></nav>'
-    cover=_visual_figure(cover_e,'商品封面图','cover-ratio') if cover_e else '<div class="v92-cover-empty">主图未采集</div>'
-    hero=f'<header class="v92-hero"><div class="wrap v92-hero-grid"><div><div class="v92-kicker">PRODUCT DECISION REPORT · BIG VISUAL · V9.2.5</div><h1>{H(title)}</h1><p class="v92-meta">{H(meta_line)}</p><div class="v925-hero-claim">{H(clean_display(verdict,45))}</div></div><div class="v92-cover">{cover}</div></div></header>'
-    doc='<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+H(title)+'</title><link rel="stylesheet" href="/report.css"></head><body>'+nav+hero+_section('01','老板 30 秒看懂','只看结果，不看分析过程',_owner_overview(exp,raw,base,sales),'decision')+_section('02','下一款先做什么','先给决策，再看证据',_plans_v92(exp,a,idx),'plan')+_section('03','标题只解决一个问题：说清楚','保留表达与动作',_title_v92(raw,exp,a),'title')+_section('04','主图到底在卖什么','图片本身就是成交语言',_main_v92(exp,a,idx),'main')+_section('05','详情页证明了什么','大图展示证明内容',_detail_v92(exp,a,idx),'detail')+_section('06','先解决适配，再解决审美','SKU看选择路径',_sku_v92(exp,a,raw,idx),'sku')+_section('07','消费者真正感受到什么','买家秀是证据',_consumer_v92(exp,a,idx),'review')+f'<footer class="v92-footer"><div class="wrap">Task {H(task_id)} · 三笙商品开品分析报告引擎 V9.2.5 · 未采集经营指标不作推断</div></footer><script>document.addEventListener("error",e=>{{if(e.target&&e.target.tagName==="IMG"){{const f=e.target.closest("figure.visual");if(f)f.classList.add("failed");e.target.style.display="none";}}}},true);</script></body></html>'
-    return doc
+    payload=json.dumps(a,ensure_ascii=False,separators=(',',':')).replace('</','<\\/').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
+    return '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="generator" content="Sansong Product Intelligence V9.3.0"><title>'+H(title)+'</title><link rel="stylesheet" href="/report.css"></head><body><main id="app" class="report-app"></main><script>window.REPORT_DATA='+payload+';</script><script src="/report.js"></script></body></html>'

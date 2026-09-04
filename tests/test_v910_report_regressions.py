@@ -21,8 +21,9 @@ class V910RegressionTest(unittest.TestCase):
     def test_missing_sku_not_rendered_as_zero(self):
         doc=render(self.base_result(),'test')
         self.assertNotIn('SKU 0',doc)
-        self.assertIn('结构化SKU 未完整采集',doc)
-        self.assertIn('SKU图片数量不等于SKU数量',doc)
+        self.assertNotIn('结构化SKU 未完整采集',doc)
+        self.assertNotIn('SKU图片数量不等于SKU数量',doc)
+        self.assertIn('window.REPORT_DATA=',doc)
 
     def test_renderer_prefers_local_image_and_keeps_remote_fallback(self):
         entry={'value':'https://img.example.com/a.jpg','meta':{'localUrl':'/reports/assets/test/main/IMG_MAIN_0001.jpg','sourceUrl':'https://img.example.com/a.jpg'}}

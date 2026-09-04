@@ -2,7 +2,7 @@ import json, os, re, ssl, time, urllib.request, urllib.error
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = '9.2.5'
+SERVER_VERSION = '9.3.0'
 
 def load_config():
     cfg = {}
@@ -64,7 +64,7 @@ def _ssl_context(c):
     return ctx
 
 def _headers(c):
-    h={'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer '+c['api_key'],'User-Agent':'TmallAIProductAnalysis/9.2.5'}
+    h={'Content-Type':'application/json','Accept':'application/json','Authorization':'Bearer '+c['api_key'],'User-Agent':'TmallAIProductAnalysis/9.3.0'}
     h.update(c.get('extra_headers',{}))
     return h
 
@@ -145,4 +145,8 @@ def chat_json(system, user, images=None, max_tokens=5000):
                 last=RuntimeError(f'模型接口调用失败: {e}')
         if attempt<c['retries']:
             time.sleep(min(1.5*(attempt+1),4))
+    # 电商详情页偶有 1-2px 占位图或超长切片；部分多模态模型会拒绝整批图片。
+    # 证据文本仍在 user 中，因此自动改用纯文本证据重试，不能让单张坏图吞掉整份报告。
+    if images and last and 'image length and width' in str(last).lower():
+        return chat_json(system, user, images=None, max_tokens=max_tokens)
     raise last or RuntimeError('模型接口调用失败')

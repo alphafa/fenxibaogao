@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "三笙 · 电商商品分析闭环 V9.2.5",
-  "version": "9.2.5",
+  "name": "三笙 · 电商商品分析闭环 V9.3.0",
+  "version": "9.3.0",
   "description": "跨类目电商商品分析：动态参数与SKU采集、图文分源、评论证据、开品与AI视觉方案。",
   "permissions": [
     "scripting",
@@ -20,7 +20,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "三笙 · 电商商品分析闭环 V9.2.5"
+    "default_title": "三笙 · 电商商品分析闭环 V9.3.0"
   },
   "content_scripts": [
     {

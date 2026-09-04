@@ -33,13 +33,12 @@ class V920ImageDrivenReportTest(unittest.TestCase):
 
     def test_renderer_is_image_driven_and_professional(self):
         doc=render(self.fixture(),'v920')
-        for text in ('老板速览','下一款先做什么','主图到底在卖什么','详情页证明了什么','先解决适配，再解决审美','消费者真正感受到什么'):
-            self.assertIn(text,doc)
-        self.assertIn('v92-main-grid',doc)
-        self.assertIn('v925-detail-list',doc)
-        self.assertIn('v92-sku-mosaic',doc)
-        self.assertIn('v92-buyer-grid',doc)
-        self.assertIn('v925-plan-grid',doc)
+        self.assertIn('window.REPORT_DATA=',doc)
+        self.assertIn('<script src="/report.js"></script>',doc)
+        self.assertIn('IMG_MAIN_0001',doc)
+        self.assertIn('IMG_DETAIL_0001',doc)
+        self.assertNotIn('v92-main-grid',doc)
+        self.assertNotIn('v925-detail-list',doc)
         self.assertNotIn('[数据事实]',doc)
         self.assertNotIn('[分析判断]',doc)
         self.assertNotIn('[设计建议]',doc)
@@ -48,8 +47,9 @@ class V920ImageDrivenReportTest(unittest.TestCase):
 
     def test_cover_has_no_card_border_wrapper(self):
         doc=render(self.fixture(),'v920')
-        self.assertIn('class="v92-cover"',doc)
-        self.assertIn('cover-ratio',doc)
+        self.assertIn('"coverImageId":"IMG_MAIN_0001"',doc)
+        self.assertNotIn('class="v92-cover"',doc)
+        self.assertNotIn('cover-ratio',doc)
         self.assertNotIn('hero-shot',doc)
 
     def test_launch_fallback_never_empty_with_real_evidence(self):

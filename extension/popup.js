@@ -1,5 +1,5 @@
 const SERVER='http://127.0.0.1:17962';
-const EXPECTED_SERVER_VERSION='9.2.5';
+const EXPECTED_SERVER_VERSION='9.3.0';
 let backendCompatible=false;
 const server=document.getElementById('server'),status=document.getElementById('status'),bar=document.getElementById('bar'),runBtn=document.getElementById('run'),stopBtn=document.getElementById('stop'),reviewLive=document.getElementById('reviewLive'),liveCount=document.getElementById('liveCount'),liveNet=document.getElementById('liveNet'),liveRound=document.getElementById('liveRound'),liveStagnant=document.getElementById('liveStagnant'),liveMode=document.getElementById('liveMode'),liveElapsed=document.getElementById('liveElapsed'),livePreview=document.getElementById('livePreview');
 const paramLive=document.getElementById('paramLive'),paramState=document.getElementById('paramState'),paramCount=document.getElementById('paramCount'),paramTags=document.getElementById('paramTags'),paramMissing=document.getElementById('paramMissing');
@@ -31,10 +31,15 @@ async function refresh(){
    }
    if(lp){liveCount.textContent=lp.count??0;liveNet.textContent=lp.networkReviewObjects??0;liveRound.textContent=lp.round??0;liveStagnant.textContent=lp.stagnant??0;liveMode.textContent=lp.mode||'—';liveElapsed.textContent=Math.round((lp.elapsedMs||0)/1000)+'s';livePreview.innerHTML=(lp.preview||[]).map((x,i)=>`<div>${i+1}. ${String(x).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`).join('')||'等待评论数据…'}}else{status.textContent='已识别当前商品，等待手动开始。';bar.style.width='0%';runBtn.textContent='开始深度采集';stopBtn.style.display='none';reviewLive.style.display='none'}
 }
-let collectionMode='standard';
+let collectionMode='500';
+const sampleButtons=[...document.querySelectorAll('[data-sample]')];
+const customSampleWrap=document.getElementById('customSampleWrap');
+const customSample=document.getElementById('customSample');
+sampleButtons.forEach(btn=>btn.addEventListener('click',()=>{sampleButtons.forEach(x=>x.classList.remove('active'));btn.classList.add('active');collectionMode=btn.dataset.sample;customSampleWrap.style.display=collectionMode==='custom'?'block':'none';}));
+;(async()=>{try{const t=await active();const p=(await chrome.storage.local.get('status_'+t.id))['status_'+t.id];if((p?.state==='reviews_incomplete'||p?.state==='reviews_stopped')&&p.sampleMode){collectionMode=p.sampleMode;sampleButtons.forEach(x=>x.classList.toggle('active',x.dataset.sample===collectionMode));customSampleWrap.style.display=collectionMode==='custom'?'block':'none'}}catch(e){}})();
 runBtn.onclick=async()=>{
  if(!backendCompatible){status.textContent='插件与本地后端版本不一致，请先双击本包“start-tmall-ai.command”';return}
- const t=await active();status.textContent='开始采集当前商品…';try{const r=await chrome.runtime.sendMessage({type:'RUN_CURRENT',tabId:t.id,collectionMode});if(r?.needsReviewResume){status.textContent=r.message||'评论还没到末页，请继续采集';runBtn.textContent='继续采集评论'}else if(!r?.ok){status.textContent='采集失败：'+(r?.error||'未知错误')}}catch(e){status.textContent='采集失败：'+String(e)}setTimeout(refresh,500)};
+ const t=await active();let sample=collectionMode;if(sample==='custom'){const n=Number(customSample?.value||0);if(!Number.isInteger(n)||n<1||n>10000){status.textContent='请输入 1-10000 的评论数量';return}sample=String(n)}status.textContent=`开始采集当前商品（评论样本 ${sample==='all'?'全部':sample+' 条'}）…`;try{const r=await chrome.runtime.sendMessage({type:'RUN_CURRENT',tabId:t.id,sampleMode:sample});if(r?.needsReviewResume){status.textContent=r.message||'评论采集已暂停，可继续';runBtn.textContent='继续采集评论'}else if(!r?.ok){status.textContent='采集失败：'+(r?.error||'未知错误')}}catch(e){status.textContent='采集失败：'+String(e)}setTimeout(refresh,500)};
 document.getElementById('open').onclick=()=>chrome.tabs.create({url:SERVER+'/'});
 document.getElementById('importMonitor')?.addEventListener('click',()=>document.getElementById('monitorFile')?.click());
 document.getElementById('monitorFile')?.addEventListener('change',async e=>{
@@ -88,12 +93,11 @@ let analysisMode='standard';
 
 function setMode(mode){
   analysisMode=mode;
-  collectionMode=mode;
   modeQuick?.classList.toggle('active',mode==='quick');
   modeStandard?.classList.toggle('active',mode==='standard');
   modeFull?.classList.toggle('active',mode==='full');
   if(analyzeNow){
-    analyzeNow.textContent=mode==='quick'?'先看当前结论':mode==='standard'?'采集并生成报告':'完整采集后自动分析';
+    analyzeNow.textContent='基于当前数据开始分析';
     analyzeNow.disabled=false;
   }
 }

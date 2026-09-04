@@ -47,11 +47,13 @@ class EvidenceOnlyReportTest(unittest.TestCase):
             'meta': {},
         }
 
-    def test_empty_model_result_does_not_generate_fallback_report(self):
+    def test_empty_model_result_still_generates_reviewable_report(self):
         result = ensure_experience_solution(self.analysis)
         self.assertFalse(result['meta']['fallbackReport'])
-        self.assertFalse(result['meta']['reportReady'])
-        self.assertIn('不输出兜底报告', result['meta']['reportBlockedReason'])
+        self.assertTrue(result['meta']['reportReady'])
+        self.assertFalse(result['meta']['reportAuditPassed'])
+        self.assertEqual('needs_review', result['meta']['reportQuality'])
+        self.assertIn('审核未通过', result['meta']['reportNotice'])
         self.assertEqual('', result['facts']['product']['title'])
         self.assertEqual(['面料支数', '床单面料材质', '适用床尺寸'], [x['name'] for x in result['facts']['attributes']])
         self.assertEqual(2, result['baseline']['reviewCount'])
@@ -61,18 +63,20 @@ class EvidenceOnlyReportTest(unittest.TestCase):
         self.assertEqual('下一款明确卖点', cards[0]['label'])
         self.assertIn('ATTR_0003', cards[0]['evidenceIds'])
         self.assertEqual([], result['experienceSolution']['productExperience']['gates'])
-        with self.assertRaisesRegex(ValueError, '不输出兜底报告'):
-            render(result, 'fixture')
+        html = render(result, 'fixture')
+        self.assertIn('审核未通过', html)
 
-    def test_analysis_runs_without_model_channel(self):
+    def test_analysis_runs_without_model_channel_uses_evidence_fallback(self):
         raw = dict(self.analysis['facts'])
         raw['_model_available'] = False
         result = analyze(raw)
         self.assertFalse(result['meta']['modelUsed'])
-        self.assertEqual('9.2.5', result['meta']['engineVersion'])
+        self.assertEqual('9.3.0', result['meta']['engineVersion'])
         self.assertEqual('home_textile', result['meta']['industryTemplate'])
         self.assertFalse(result['meta']['fallbackReport'])
-        self.assertFalse(result['meta']['reportReady'])
+        self.assertTrue(result['meta']['reportReady'])
+        self.assertTrue(result['experienceSolution']['reportSummary']['title'])
+        self.assertEqual(7, len(result['roleOutputs']))
 
     def test_historical_fallback_json_is_rejected(self):
         result = ensure_experience_solution({
@@ -198,9 +202,9 @@ class EvidenceOnlyReportTest(unittest.TestCase):
         self.assertNotIn('决定成交', output)
         self.assertNotIn('爆款', output)
         doc = render(result, 'evidence-only')
-        self.assertIn('老板速览', doc)
-        self.assertIn('下一款先做什么', doc)
-        self.assertIn('V9.2.5', doc)
+        self.assertIn('window.REPORT_DATA=', doc)
+        self.assertIn('Sansong Product Intelligence V9.3.0', doc)
+        self.assertIn('<script src="/report.js"></script>', doc)
         self.assertNotIn('项目负责人', doc)
 
     def test_incomplete_final_editor_output_is_repaired_from_real_evidence(self):

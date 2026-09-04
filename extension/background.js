@@ -56,11 +56,11 @@ chrome.runtime.onMessage.addListener((m,s,send)=>{
     return true;
   }
   if(m?.type==='STOP_COLLECTION'){(async()=>{try{await chrome.scripting.executeScript({target:{tabId:m.tabId},world:'MAIN',func:()=>{window.__TMALL_AI_STOP_REVIEW__=true;}});send({ok:true})}catch(e){send({ok:false,error:String(e)})}})();return true;}
-  if(m?.type==='RUN_CURRENT'){ run(m.tabId,true,m.collectionMode||'standard').then(x=>send(x)).catch(e=>send({ok:false,error:String(e)})); return true; }
+  if(m?.type==='RUN_CURRENT'){ run(m.tabId,true,m.sampleMode||'500').then(x=>send(x)).catch(e=>send({ok:false,error:String(e)})); return true; }
   if(m?.type==='HEALTH'){ health().then(send); return true; }
 });
 
-async function run(tabId,manual,collectionMode='standard'){
+async function run(tabId,manual,sampleMode='500'){
   const tab=await chrome.tabs.get(tabId);
   if(!isProduct(tab.url)) throw new Error('当前标签页不是天猫/淘宝商品详情页');
   const h=await health();
@@ -80,10 +80,10 @@ async function run(tabId,manual,collectionMode='standard'){
   if(pageState?.login){await setStatus(tabId,{state:'login_required',message:'淘宝要求登录。请先在当前浏览器登录淘宝，再刷新商品页重试。',progress:0});throw new Error('淘宝商品页未登录：请登录后刷新当前商品页再采集')}
   if(pageState?.verification){await setStatus(tabId,{state:'verification_required',message:'页面出现淘宝安全验证，请手动完成后刷新重试。',progress:0});throw new Error('页面出现淘宝安全验证，请手动完成验证后重试')}
   if(!isProduct(pageState?.url)){throw new Error('商品页已跳转，当前不是可采集的淘宝/天猫详情页')}
-  await setStatus(tabId,{state:'collecting',message:'正在采集当前商品：主图、SKU、详情、参数、问答与评论。不会采集推荐商品…',progress:10});
+  await setStatus(tabId,{state:'collecting',sampleMode,message:`正在采集当前商品：主图、SKU、详情、参数、问答与评论（评论样本：${sampleMode==='all'?'全部':sampleMode+' 条'}）。不会采集推荐商品…`,progress:10});
   await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{window.__TMALL_AI_STOP_REVIEW__=false;window.__TMALL_AI_REVIEW_PROGRESS__={count:0,round:0,stagnant:0,mode:'启动',elapsedMs:0,preview:[]};}});
   let collectorDone=false,collectorError=null;const startedAt=Date.now();
-  const collectorPromise=chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[manual,collectionMode]}).then(v=>v).catch(e=>{collectorError=e;return null}).finally(()=>{collectorDone=true});
+  const collectorPromise=chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[manual,sampleMode]}).then(v=>v).catch(e=>{collectorError=e;return null}).finally(()=>{collectorDone=true});
   while(!collectorDone){try{const rr=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>window.__TMALL_AI_REVIEW_PROGRESS__||null});const live=rr?.[0]?.result;if(live)await setStatus(tabId,{state:'collecting_reviews',message:`评论采集中：${live.count||0} 条 · ${live.mode||'处理中'}${live.stagnant?` · ${live.stagnant}轮无新增`:''}`,progress:Math.min(67,18+(Number(live.round||0)*2)),reviewLive:{...live,elapsedMs:Date.now()-startedAt}})}catch(e){}await sleep(600)}
   const collectorResult=await collectorPromise;
   if(collectorError)throw new Error('页面采集脚本执行失败：'+String(collectorError?.message||collectorError));
@@ -110,7 +110,7 @@ async function run(tabId,manual,collectionMode='standard'){
     const noReviewData=!raw.reviews?.length&&!raw.collection?.networkReviewResponses;
     const folded=raw.collection?.foldedDefaultReviewCount?`；平台另折叠 ${raw.collection.foldedDefaultReviewCount} 条默认好评，未提供逐条内容`:'';
     const msg=stopped?`已终止采集，并保存当前 ${raw.reviews?.length||0} 条评论。可随时继续。`:human?`评论已保存 ${raw.reviews?.length||0} 条，页面出现验证。请手动完成验证后继续。`:noReviewData?'页面未释放可读取的评论数据。商品信息已保存；请在当前页打开“评价/评论”后再次点击继续采集。':`评论已保存 ${raw.reviews?.length||0} 条，尚未确认完整${folded}。已停止低效空转，可继续采集。`;
-    await setStatus(tabId,{state:stopped?'reviews_stopped':'reviews_incomplete',message:msg,progress:68,itemId:raw.product.itemId,reviewStopReason:reason,reviewLive:raw.collection?.reviewLive||null,parameterStatus:raw.product?.parameterCollection||null});
+    await setStatus(tabId,{state:stopped?'reviews_stopped':'reviews_incomplete',sampleMode, message:msg,progress:68,itemId:raw.product.itemId,reviewStopReason:reason,reviewLive:raw.collection?.reviewLive||null,parameterStatus:raw.product?.parameterCollection||null});
     return {ok:false,needsReviewResume:true,message:msg,reviewStopReason:reason,rawStats:{title:raw.product?.title||'',reviews:raw.reviews?.length||0,questions:raw.questions?.length||0,sku:raw.sku?.length||0,attributes:raw.attributes?.length||0,promotions:raw.promotions?.length||0,images:raw.images?.all?.length||0}};
   }
   await setStatus(tabId,{state:'sending',message:`评论完整性已确认，共 ${raw.reviews?.length||0} 条。正在生成新品开品闭环…`,progress:78,itemId:raw.product.itemId});
@@ -121,7 +121,7 @@ async function run(tabId,manual,collectionMode='standard'){
   return {ok:true,taskId:j.taskId,rawStats:{title:raw.product?.title||'',reviews:raw.reviews?.length||0,questions:raw.questions?.length||0,sku:raw.sku?.length||0,attributes:raw.attributes?.length||0,promotions:raw.promotions?.length||0,images:raw.images?.all?.length||0}};
 }
 
-async function collector(manual=false,collectionMode='standard'){
+async function collector(manual=false,sampleMode='500'){
   const delay=ms=>new Promise(r=>setTimeout(r,ms));
   const text=(el)=>el?.innerText?.trim()||el?.textContent?.trim()||'';
   const clean=s=>(s||'').replace(/\s+/g,' ').trim();
@@ -144,7 +144,7 @@ async function collector(manual=false,collectionMode='standard'){
   const bodyText=clean(bodyClone?.innerText||document.body?.innerText||'');
   const captured=[];
   const reviews=[]; const questions=[];
-  const reviewCap=collectionMode==='quick'?300:(collectionMode==='full'?3000:800);
+  const reviewCap=sampleMode==='all'?Infinity:Math.max(1,Math.min(10000,Number(sampleMode)||500));
   const reviewNetMeta={totals:[],hasMoreFalse:false,lastPageFlags:[],pageHints:[],networkReviewObjects:0,networkResponses:0};
   const reviewStartedAt=Date.now();
   const processedCaptureKeys=new Set();
@@ -331,7 +331,7 @@ async function collector(manual=false,collectionMode='standard'){
     // 每轮即时解析已捕获网络响应
     const capNow=(window.__TMALL_AI_CAPTURE__||[]).slice(-120);for(const c of capNow){try{const ck=String(c.__safeKey||[c.method||'',c.url||'',String(c.text||'').slice(0,240)].join('|'));if(processedCaptureKeys.has(ck))continue;processedCaptureKeys.add(ck);if(/review|rate|comment|feed/i.test(c.url||''))reviewNetMeta.networkResponses++;let z=(c.text||'').replace(/^\s*[\w$.]+\(/,'').replace(/\)\s*;?\s*$/,'');try{walk(JSON.parse(z),0,c.url||'')}catch(_){const m=z.match(/\{[\s\S]*\}/);if(m)try{walk(JSON.parse(m[0]),0,c.url||'')}catch(__){}}}catch(e){}}
     collectVisibleReviews();collectVisibleQuestions();const after=dedupReviewCount();stagnant=after<=before?stagnant+1:0;publishReviewProgress(round+1,stagnant,next?'翻页/加载更多':'短滚动',{lastDelta:after-before});
-    if(collectionMode!=='full' && after>=reviewCap){collectionComplete=true;explicitEnd=true;stopReason='sample_cap';publishReviewProgress(round+1,stagnant,collectionMode==='quick'?'已采够快速样本':'已采够标准样本');break}
+    if(Number.isFinite(reviewCap) && after>=reviewCap){collectionComplete=true;explicitEnd=true;stopReason='sample_cap';publishReviewProgress(round+1,stagnant,`已采够 ${reviewCap} 条评论样本`);break}
     const bodyNow=clean(document.body?.innerText||'');const noMoreText=/没有更多(?:评价|评论)|已显示全部(?:评价|评论)|到底了|暂无更多(?:评价|评论)/.test(bodyNow);const captcha=/验证码|滑块|安全验证|访问过于频繁|操作频繁/.test(bodyNow);
     if(captcha){stopReason='human_verification_required';publishReviewProgress(round+1,stagnant,'需要人工验证');break}
     if((disabledNext||noMoreText)&&stagnant>=1){explicitEnd=true;collectionComplete=true;stopReason='explicit_last_page';publishReviewProgress(round+1,stagnant,'页面明确结束');break}
@@ -581,6 +581,6 @@ async function collector(manual=false,collectionMode='standard'){
     sales:{currentPrice:priceValue,sold:soldValue,ranking:rankMatch?.[1]||''},
     sku:skuTexts.map(name=>({name})),attributes:attrs,promotions:promoTexts.map(text=>({text})),
     images:{main,detail,sku:skuImages,buyerShow:buyer,all:allImgs,provenance,classification:{version:'strict-v1',classifiedCount:allImgs.length,unclassifiedCount:Math.max(0,allPageCandidates.length-allImgs.length),groupsAreDisjoint:true}},
-    reviews:reviewRows,questions:[...deQ.values()],pageText:liveBodyText.slice(0,120000),collection:{reviewActual:deReview.size,reviewSampled,reviewSampleCap:reviewCap,reviewCollectionMode:collectionMode,questionActual:deQ.size,reviewDrawerOpened:reviewDrawerWasOpened,reviewCollectionComplete:collectionComplete,reviewCompleteness:reviewSampled?'sampled':(collectionComplete?'confirmed':'unconfirmed'),reviewStopReason:reviewSampled?'sample_cap':stopReason,reviewPagesVisited:pagesVisited,publicReviewCount:publicRaw,publicReviewCountNumeric:publicNumeric,foldedDefaultReviewCount:foldedDefaultMatch?parseCount(foldedDefaultMatch[1]):null,defaultPraiseBuyerCount:defaultPraiseMatch?parseCount(defaultPraiseMatch[1]):null,networkReviewTotal:networkTotal,networkReviewObjects:reviewNetMeta.networkReviewObjects,networkReviewResponses:reviewNetMeta.networkResponses,networkExplicitEnd:reviewNetMeta.hasMoreFalse||reviewNetMeta.lastPageFlags.length>0,explicitEnd,reviewLive:window.__TMALL_AI_REVIEW_PROGRESS__||null}
+    reviews:reviewRows,questions:[...deQ.values()],pageText:liveBodyText.slice(0,120000),collection:{reviewActual:deReview.size,reviewSampled,reviewSampleCap:Number.isFinite(reviewCap)?reviewCap:null,reviewCollectionMode:sampleMode,questionActual:deQ.size,reviewDrawerOpened:reviewDrawerWasOpened,reviewCollectionComplete:collectionComplete,reviewCompleteness:reviewSampled?'sampled':(collectionComplete?'confirmed':'unconfirmed'),reviewStopReason:reviewSampled?'sample_cap':stopReason,reviewPagesVisited:pagesVisited,publicReviewCount:publicRaw,publicReviewCountNumeric:publicNumeric,foldedDefaultReviewCount:foldedDefaultMatch?parseCount(foldedDefaultMatch[1]):null,defaultPraiseBuyerCount:defaultPraiseMatch?parseCount(defaultPraiseMatch[1]):null,networkReviewTotal:networkTotal,networkReviewObjects:reviewNetMeta.networkReviewObjects,networkReviewResponses:reviewNetMeta.networkResponses,networkExplicitEnd:reviewNetMeta.hasMoreFalse||reviewNetMeta.lastPageFlags.length>0,explicitEnd,reviewLive:window.__TMALL_AI_REVIEW_PROGRESS__||null}
   };
 }
