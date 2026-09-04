@@ -626,6 +626,7 @@ body{background:#fff;color:var(--v92-text);font-size:14px;line-height:1.55}
 .hero-stat-status{border:2px solid #2c8a68;background:#eaf8f1;color:#145d43;box-shadow:0 5px 16px rgba(44,138,104,.14)}
 .hero-stat-status small{color:#237454;font-weight:800}
 .hero-stat-status b{font-size:20px;letter-spacing:.02em}
+.buyer-story .case-scenario,.buyer-story .case-insight{margin:12px 0 0;color:var(--v92-text);font-size:13px;line-height:1.55}.buyer-story .case-scenario b,.buyer-story .case-insight b{display:inline-block;margin-right:8px;color:#a56520;font-size:11px}
 @media(max-width:1050px){.hero-deck{right:0;width:470px;height:560px}.hero-deck-card{width:285px;height:460px}}
 @media(max-width:800px){.hero-deck{width:380px;height:400px}.hero-deck-card{width:215px;height:340px}}
 @media(max-width:560px){.hero-deck{width:300px;height:320px}.hero-deck-card{width:175px;height:275px}.hero-stat{padding:7px 10px}.hero-stat-status b{font-size:17px}}
