@@ -1,4 +1,5 @@
 import json, os, threading, time, uuid, traceback, html, base64, csv, io, zipfile, re, mimetypes, hashlib, urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote_to_bytes
@@ -252,7 +253,22 @@ def worker(tid, raw):
                 if step=='visual' and not counts['main']:t['steps'][step]='not_collected'
                 elif step=='detail' and not counts['detail']:t['steps'][step]='not_collected'
                 else:t['steps'][step]=state
-        result=analyze(raw,progress)
+        # 分析设置硬超时，避免模型/API异常导致任务永久停留在“处理中”。
+        timeout_seconds=max(60,int(os.getenv('TMALL_ANALYSIS_TIMEOUT','900')))
+        pool=ThreadPoolExecutor(max_workers=1)
+        future=pool.submit(analyze,raw,progress)
+        try:
+            result=future.result(timeout=timeout_seconds)
+        except FutureTimeout:
+            future.cancel()
+            # 用无模型本地路径生成可交付报告，而不是让任务卡死。
+            result=analyze({**raw,'_model_available':False},progress)
+        except Exception as analysis_error:
+            # 模型返回结构异常或单个分析模块崩溃时，退回证据驱动本地报告。
+            result=analyze({**raw,'_model_available':False},progress)
+            result.setdefault('meta',{})['reportNotice']=f'部分分析模块异常，已输出证据报告：{analysis_error}'
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         if not (result.get('meta') or {}).get('reportReady'):
             (REPORTS/f'{tid}.failed.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),'utf-8')
             raise RuntimeError((result.get('meta') or {}).get('reportBlockedReason') or '模型未生成可输出报告，本次不使用兜底内容。')
@@ -297,7 +313,11 @@ async function tick(){
 '''
 
 def save_config(data):
+    if not isinstance(data, dict):
+        raise ValueError('配置请求必须是 JSON 对象')
     p=ROOT/'config.json'
+    # 完整包首次解压或被移动后，确保配置目录存在再进行原子写入。
+    p.parent.mkdir(parents=True, exist_ok=True)
     old={}
     if p.exists():
         try: old=json.loads(p.read_text('utf-8'))
@@ -343,7 +363,9 @@ def control_page():
 def prompt_page():
     saved={}
     if PROMPT_CONFIG.exists():
-        try: saved=json.loads(PROMPT_CONFIG.read_text('utf-8'))
+        try:
+            saved=json.loads(PROMPT_CONFIG.read_text('utf-8'))
+            if not isinstance(saved,dict): saved={}
         except Exception: saved={}
     items={k:{'name':v.name,'body':saved.get(k,{}).get('body',v.body),'variables':list(v.variables)} for k,v in TEMPLATES.items()}
     vars_html=''.join(f'<div class="var"><b>{html.escape(k)}</b><br>{html.escape(v)}</div>' for k,v in PRODUCT_VARIABLES.items())
@@ -468,7 +490,9 @@ class H(BaseHTTPRequestHandler):
         if p=='/api/prompts':
             saved={}
             if PROMPT_CONFIG.exists():
-                try: saved=json.loads(PROMPT_CONFIG.read_text('utf-8'))
+                try:
+                    saved=json.loads(PROMPT_CONFIG.read_text('utf-8'))
+                    if not isinstance(saved,dict): saved={}
                 except Exception: pass
             self.send_json({'ok':True,'variables':PRODUCT_VARIABLES,'templates':{k:{'body':saved.get(k,{}).get('body',v.body),'variables':list(v.variables)} for k,v in TEMPLATES.items()}}); return
         if p=='/prompts':

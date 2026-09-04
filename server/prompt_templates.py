@@ -53,7 +53,8 @@ def build_system_prompt(system_text):
     if override.exists():
         try:
             data=json.loads(override.read_text('utf-8'))
-            if data.get('system',{}).get('body'): return data['system']['body'].format(system=system_text, variable_schema=variable_schema())
+            if isinstance(data, dict) and isinstance(data.get('system'), dict) and data['system'].get('body'):
+                return data['system']['body'].format(system=system_text, variable_schema=variable_schema())
         except Exception: pass
     return TEMPLATES["system"].render(system=system_text, variable_schema=variable_schema())
 

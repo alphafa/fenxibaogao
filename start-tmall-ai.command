@@ -29,7 +29,8 @@ if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 cd "$SERVER"
-[ -f config.json ] || cp config.example.json config.json
+mkdir -p "$SERVER"
+if [ ! -f config.json ] && [ -f config.example.json ]; then cp config.example.json config.json; fi
 
 osascript <<APPLESCRIPT
 tell application "Terminal"
