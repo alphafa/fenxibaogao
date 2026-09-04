@@ -614,3 +614,18 @@ body{background:#fff;color:var(--v92-text);font-size:14px;line-height:1.55}
 @media(max-width:700px){.role-evidence>div.role-evidence-list{grid-template-columns:1fr}.role-evidence-item.has-image{grid-template-columns:58px minmax(0,1fr)}.role-evidence-item>img{width:58px!important;height:58px!important}}
 /* 审核失败仍输出报告时的非阻断提示 */
 .report-audit-notice{margin-top:14px!important;padding:10px 12px;border-left:3px solid #d59b3f;background:#fff7e8;color:#805a20!important;font-size:13px!important;line-height:1.5!important;text-shadow:none!important}
+
+/* Cover emphasis: give the evidence gallery more visual weight and make report status scannable. */
+.hero-deck{right:3%;width:590px;height:650px}
+.hero-deck-card{width:340px;height:550px}
+.hero-carousel .hero-copy{max-width:560px}
+.hero-meta{gap:12px;align-items:stretch}
+.hero-stat{display:inline-flex;flex-direction:column;gap:3px;padding:9px 14px;border:1px solid #d9e1e8;background:#f7f9fb;color:#27313d;font-size:14px;line-height:1.2}
+.hero-stat small{font-size:10px;color:#7a8794;letter-spacing:.03em}
+.hero-stat b{font-size:16px;font-weight:750}
+.hero-stat-status{border:2px solid #2c8a68;background:#eaf8f1;color:#145d43;box-shadow:0 5px 16px rgba(44,138,104,.14)}
+.hero-stat-status small{color:#237454;font-weight:800}
+.hero-stat-status b{font-size:20px;letter-spacing:.02em}
+@media(max-width:1050px){.hero-deck{right:0;width:470px;height:560px}.hero-deck-card{width:285px;height:460px}}
+@media(max-width:800px){.hero-deck{width:380px;height:400px}.hero-deck-card{width:215px;height:340px}}
+@media(max-width:560px){.hero-deck{width:300px;height:320px}.hero-deck-card{width:175px;height:275px}.hero-stat{padding:7px 10px}.hero-stat-status b{font-size:17px}}
