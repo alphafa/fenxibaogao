@@ -1,4 +1,5 @@
 const SERVER='http://127.0.0.1:17962';
+const EXTENSION_VERSION=chrome.runtime.getManifest().version;
 const RUN_GAP=8*60*1000;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const isProduct=u=>/^https:\/\/detail\.tmall\.com\/item\.htm/i.test(u||'') || /item\.taobao\.com\/item\.htm/i.test(u||'');
@@ -33,7 +34,7 @@ chrome.runtime.onMessage.addListener((m,s,send)=>{
           // 没有历史raw时，做一次“轻采集”：复用 collector，但立即给 stop flag，
           // 只保留当前页面已经可见/已捕获的数据，不再长时间采评论。
           await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{window.__TMALL_AI_STOP_REVIEW__=true;}});
-          const [{result:r}]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[true]});
+          const [{result:r}]=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[true,'500',EXTENSION_VERSION]});
           raw=r;
         }
         if(!raw){send({ok:false,error:'当前没有可用于分析的数据'});return}
@@ -83,7 +84,7 @@ async function run(tabId,manual,sampleMode='500'){
   await setStatus(tabId,{state:'collecting',sampleMode,message:`正在采集当前商品：主图、SKU、详情、参数、问答与评论（评论样本：${sampleMode==='all'?'全部':sampleMode+' 条'}）。不会采集推荐商品…`,progress:10});
   await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>{window.__TMALL_AI_STOP_REVIEW__=false;window.__TMALL_AI_REVIEW_PROGRESS__={count:0,round:0,stagnant:0,mode:'启动',elapsedMs:0,preview:[]};}});
   let collectorDone=false,collectorError=null;const startedAt=Date.now();
-  const collectorPromise=chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[manual,sampleMode]}).then(v=>v).catch(e=>{collectorError=e;return null}).finally(()=>{collectorDone=true});
+  const collectorPromise=chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:collector,args:[manual,sampleMode,EXTENSION_VERSION]}).then(v=>v).catch(e=>{collectorError=e;return null}).finally(()=>{collectorDone=true});
   while(!collectorDone){try{const rr=await chrome.scripting.executeScript({target:{tabId},world:'MAIN',func:()=>window.__TMALL_AI_REVIEW_PROGRESS__||null});const live=rr?.[0]?.result;if(live)await setStatus(tabId,{state:'collecting_reviews',message:`评论采集中：${live.count||0} 条 · ${live.mode||'处理中'}${live.stagnant?` · ${live.stagnant}轮无新增`:''}`,progress:Math.min(67,18+(Number(live.round||0)*2)),reviewLive:{...live,elapsedMs:Date.now()-startedAt}})}catch(e){}await sleep(600)}
   const collectorResult=await collectorPromise;
   if(collectorError)throw new Error('页面采集脚本执行失败：'+String(collectorError?.message||collectorError));
@@ -121,7 +122,7 @@ async function run(tabId,manual,sampleMode='500'){
   return {ok:true,taskId:j.taskId,rawStats:{title:raw.product?.title||'',reviews:raw.reviews?.length||0,questions:raw.questions?.length||0,sku:raw.sku?.length||0,attributes:raw.attributes?.length||0,promotions:raw.promotions?.length||0,images:raw.images?.all?.length||0}};
 }
 
-async function collector(manual=false,sampleMode='500'){
+async function collector(manual=false,sampleMode='500',collectorVersion='9.3.0'){
   const delay=ms=>new Promise(r=>setTimeout(r,ms));
   const text=(el)=>el?.innerText?.trim()||el?.textContent?.trim()||'';
   const clean=s=>(s||'').replace(/\s+/g,' ').trim();
@@ -576,7 +577,7 @@ async function collector(manual=false,sampleMode='500'){
   const completeness=collectionComplete?'confirmed':'unconfirmed';
   await saveCheckpoint({reviews:[...deReview.values()],questions:[...deQ.values()],round:pagesVisited,updatedAt:Date.now(),complete:collectionComplete,stopReason,completeness,networkTotal,publicNumeric,reviewNetMeta});
   return {
-    meta:{platform:location.hostname.includes('tmall')?'tmall':'taobao',collectedAt:new Date().toISOString(),url:location.href,collectorVersion:'9.2.2',imageClassificationVersion:'strict-v1',networkCaptures:captured.length,structuredRoots:roots.length},
+    meta:{platform:location.hostname.includes('tmall')?'tmall':'taobao',collectedAt:new Date().toISOString(),url:location.href,collectorVersion,imageClassificationVersion:'strict-v1',networkCaptures:captured.length,structuredRoots:roots.length},
     product:{itemId,skuId,title,shop,brand:structured.brands[0]||scriptString(['brandName','brand'],120),category:structured.categories[0]||scriptString(['categoryName','catName'],160),url:location.href,parameterCollection},
     sales:{currentPrice:priceValue,sold:soldValue,ranking:rankMatch?.[1]||''},
     sku:skuTexts.map(name=>({name})),attributes:attrs,promotions:promoTexts.map(text=>({text})),

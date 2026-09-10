@@ -1,13 +1,16 @@
 import json, os, threading, time, uuid, traceback, html, base64, csv, io, zipfile, re, mimetypes, hashlib, urllib.request, urllib.error
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, unquote_to_bytes
+from urllib.parse import urlparse, unquote_to_bytes, parse_qs
 from pathlib import Path
-from analysis import analyze, normalize
+from analysis import (
+    analyze, normalize, MAIN_VISUAL_TASKS, DETAIL_VISUAL_TASKS,
+    VISUAL_EXCLUDED_TERMS, _visual_product_text
+)
 from renderer import render
-from ai_client import configured, load_config, probe_model_api
-from prompt_templates import TEMPLATES, PRODUCT_VARIABLES
+from ai_client import configured, load_config, probe_model_api, probe_image_api, image_generate
+from prompt_templates import TEMPLATES, PRODUCT_VARIABLES, build_image_generation_prompt
 
 ROOT=Path(__file__).resolve().parent
 PROMPT_CONFIG=ROOT/'prompts.json'
@@ -22,6 +25,8 @@ LOCK=threading.Lock()
 
 
 IMAGE_ASSET_ROOT=REPORTS/'assets'; IMAGE_ASSET_ROOT.mkdir(exist_ok=True)
+GENERATED_ASSET_ROOT=IMAGE_ASSET_ROOT/'generated'; GENERATED_ASSET_ROOT.mkdir(exist_ok=True)
+IMAGE_JOBS={}
 
 def _asset_ext(url, content_type=''):
     c=(content_type or '').split(';',1)[0].strip().lower()
@@ -105,6 +110,635 @@ def cache_report_images(result, task_id):
             meta.pop('localUrl',None); meta['cacheStatus']='failed'; meta['cacheError']=str(ex)[:220]; failed+=1
     result.setdefault('meta',{})['imageCache']={'success':ok,'failed':failed,'skipped':skipped,'mode':'local-first-multi-retry-remote-fallback'}
     return result
+
+def _generated_ext(content_type='', url=''):
+    return _asset_ext(url, content_type) if content_type or url else '.png'
+
+def _save_generated_item(item, root, index):
+    """Persist one provider image response and return a browser URL."""
+    if not isinstance(item,dict): raise ValueError('图片接口返回了无效条目')
+    raw=item.get('b64_json') or item.get('base64')
+    image_obj=item.get('image_url')
+    url=item.get('url') or (image_obj.get('url') if isinstance(image_obj,dict) else image_obj if isinstance(image_obj,str) else '')
+    ctype='image/png'
+    if raw:
+        data=base64.b64decode(raw)
+    elif isinstance(url,str) and url.startswith('data:image/'):
+        head,payload=url.split(',',1); ctype=head[5:].split(';',1)[0]; data=base64.b64decode(payload) if ';base64' in head else unquote_to_bytes(payload)
+    elif isinstance(url,str) and url.startswith(('http://','https://')):
+        data,ctype=_download_image(url)
+    else:
+        raise ValueError('图片接口未返回 url 或 b64_json')
+    if not _looks_like_image(data,ctype): raise ValueError('图片接口返回内容不是有效图片')
+    ext=_generated_ext(ctype,str(url or '')); target=root/f'{index:02d}{ext}'; target.write_bytes(data)
+    return {'url':f'/reports/assets/generated/{root.name}/{target.name}','sourceUrl':url if isinstance(url,str) and url.startswith(('http://','https://')) else '', 'width':None,'height':None,'_path':str(target)}
+
+def _generated_item_data_url(item):
+    path=Path(str((item or {}).get('_path') or ''))
+    if not path.exists(): return ''
+    ctype=mimetypes.guess_type(str(path))[0] or 'image/png'
+    return 'data:'+ctype+';base64,'+base64.b64encode(path.read_bytes()).decode('ascii')
+
+def _text_list(value, limit=5):
+    keys=('signal','statement','style','asset','headline','value','topic','name','label','action','consumerValue')
+    def one(x):
+        if isinstance(x,dict):
+            return next((str(x[k]) for k in keys if x.get(k)), '')
+        return str(x) if x else ''
+    if isinstance(value,list): return [one(x)[:80] for x in value if one(x)][:limit]
+    text=one(value)
+    return [text[:80]] if text else []
+
+def _report_visual_identity_terms(report):
+    facts=report.get('facts') or {}
+    product=facts.get('product') or {}
+    terms=[]
+    for value in (product.get('brand'),):
+        value=str(value or '').strip()
+        if len(value)>=2:terms.append(value)
+    attrs=facts.get('attributes') or []
+    if isinstance(attrs,list):
+        for item in attrs:
+            if not isinstance(item,dict):continue
+            name=str(item.get('name') or '')
+            value=str(item.get('value') or '').strip()
+            if any(key in name for key in ('品牌','商标')) and len(value)>=2:
+                terms.append(value)
+    return list(dict.fromkeys(terms))
+
+def _visual_clean(value, limit=18, blocked_terms=()):
+    return _visual_product_text(value,limit,blocked_terms)[:8]
+
+def _visual_title(title, brand='', blocked_terms=()):
+    text=str(title or '商品').strip()
+    terms=[str(brand or '').strip(), *(str(term).strip() for term in blocked_terms)]
+    for term in terms:
+        if term:
+            text=text.replace(term,'')
+    parts=[]
+    for part in re.split(r'[\s｜|·]+',text):
+        if part and not any(term in part for term in VISUAL_EXCLUDED_TERMS):
+            parts.append(part)
+    return ' '.join(parts).strip() or '商品主体'
+
+def _image_user_direction(value, blocked_terms=()):
+    text=re.sub(r'\s+',' ',str(value or '')).strip()[:500]
+    blocked_terms=tuple(str(x) for x in blocked_terms if x)
+    if not text: return {'raw':'','accepted':[],'rejected':[],'ignored':[],'items':[],'blockedTerms':list(blocked_terms)}
+    risky=tuple(VISUAL_EXCLUDED_TERMS)+blocked_terms+(
+      '低价','包邮','顺丰','销量','已售','第一','冠军','专利','认证','防伪','旗舰店','正品','logo','Logo','LOGO',
+      '二维码','水印','退款','退货','客服','促销','满减','买一送一','折扣','价格','￥','¥'
+    )
+    def risky_reason(part):
+        return '涉及品牌、交易、认证或平台禁区' if any(term and term in part for term in risky) else ''
+    def scope_of(part):
+        product_terms=('商品','产品','材质','面料','材料','成分','结构','件数','尺寸','规格','颜色','花型','款式','功能','填充','支数')
+        change_terms=('换成','改成','变成','换为','改为','变为','采用','使用','调整为','设为')
+        presentation_terms=('构图','背景','氛围','镜头','光线','布局','排版','留白','主体','角度','近景','远景','特写',
+                            '场景','证明','展示','画面','视角','比例','风格','质感','酒店感','清爽','明亮','高级','极简','治愈',
+                            '拆解图','微距','拍摄')
+        has_product_term=any(term in part for term in product_terms)
+        has_change_term=any(term in part for term in change_terms)
+        has_presentation_term=any(term in part for term in presentation_terms)
+        # A product-level request is shared by the whole image set. A phrase
+        # such as “材质证明改成面料微距特写” remains a visual-only request.
+        return 'product' if has_product_term and has_change_term and not has_presentation_term else 'visual'
+    parts=[x.strip(' ，,。；;、') for x in re.split(r'[。；;，,\n]+',text) if x.strip(' ，,。；;、')]
+    accepted=[]; rejected=[]; items=[]; product_overrides=[]
+    for part in parts[:8]:
+      reason=risky_reason(part)
+      if reason:
+        rejected.append(part[:80]); items.append({'text':part[:80],'status':'rejected','reason':reason}); continue
+      clean=_visual_clean(part,40,blocked_terms)
+      if clean:
+        scope=scope_of(part)
+        accepted.extend(clean)
+        items.append({'text':'；'.join(clean),'status':'accepted','scope':scope,'reason':''})
+        if scope=='product':
+            product_overrides.extend(clean)
+      else:
+        rejected.append(part[:80]); items.append({'text':part[:80],'status':'rejected','reason':'没有可执行的视觉要求'})
+    accepted=list(dict.fromkeys(accepted))[:6]
+    rejected=list(dict.fromkeys(rejected))[:6]
+    return {'raw':text,'accepted':accepted,'rejected':rejected,'ignored':[],
+            'productOverrides':list(dict.fromkeys(product_overrides))[:6],
+            'items':items,'blockedTerms':list(blocked_terms)}
+
+def _prompt_override(value):
+    text=str(value or '').strip()
+    if not text: return ''
+    return text[:7000]
+
+def _slot_relation_terms(slot):
+    slot=slot if isinstance(slot,dict) else {}
+    terms=[]
+    terms.extend(_text_list(slot.get('role')))
+    terms.extend(_text_list(slot.get('contentKey')))
+    terms.extend(_text_list(slot.get('task')))
+    terms.extend(_text_list(slot.get('nextAction')))
+    terms.extend(_text_list(slot.get('planName')))
+    terms.extend(_text_list(slot.get('planSubtitle')))
+    terms.extend(_text_list(slot.get('planProductAction')))
+    terms.extend(_text_list(slot.get('planPageAction')))
+    content_key=str(slot.get('contentKey') or '')
+    category_terms={
+      'product_overview':('商品','产品','主体','整体','件数','套件','组合'),
+      'usage_scene':('场景','使用','空间','适用','人群','季节','用途'),
+      'material_touch':('材质','面料','成分','支数','密度','克重','填充','触感','质感','特写','近景'),
+      'structure_function':('结构','工艺','功能','做工','细节','走线','接口','拉链'),
+      'spec_choice':('尺寸','规格','件数','颜色','款式','SKU','适配'),
+      'scene_problem':('场景','使用','人群','适用','用途','问题'),
+      'material_proof':('材质','面料','成分','支数','密度','克重','填充','触感','质感','特写','近景'),
+      'structure_proof':('结构','工艺','做工','细节','缝制','接口','拉链','走线'),
+      'function_proof':('功能','性能','使用','透气','防护','收纳','连接','结果'),
+      'spec_adaptation':('规格','尺寸','件数','套件','SKU','适配','颜色','款式'),
+      'care_durability':('洗护','洗涤','护理','耐用','首洗','清洁','保存'),
+      'material_closeup':('材质','面料','成分','纤维','触感','质感','特写','近景','纹理'),
+      'craft_closeup':('工艺','缝制','绗缝','做工','细节','走线','接口'),
+      'function_scenario':('功能','使用','性能','保暖','透气','抗菌','结果'),
+      'size_compare':('尺寸','规格','床型','长度','宽度','对照'),
+      'set_inventory':('件数','套件','组合','配件','被套'),
+      'color_selection':('颜色','配色','花型','款式','SKU'),
+      'care_steps':('洗护','洗涤','护理','晾晒','保存'),
+      'quality_check':('耐用','首洗','回弹','起球','褪色'),
+      'purchase_summary':('适用','人群','场景','规格','选择'),
+    }
+    terms.extend(category_terms.get(content_key,()))
+    if slot.get('assetType')=='main':
+        terms.extend(['主图','首图','封面','点击','构图','卖点','氛围','背景','镜头','光线','留白'])
+    else:
+        terms.extend(['详情','详情图','证明','介绍','排版','对比'])
+    clean=[]
+    relation_stop_terms={'证明','详情','详情图','介绍','主图','首图','封面','点击','卖点'}
+    for term in terms:
+        for part in re.split(r'[，,。；;、\s/|]+',str(term or '')):
+            part=part.strip()
+            if len(part)>=2 and part not in relation_stop_terms: clean.append(part[:24])
+    return list(dict.fromkeys(clean))[:36]
+
+def _prompt_edit_relevance(text, slot, user_direction=None):
+    text=str(text or '').strip()
+    if not text: return {'related':False,'matched':[],'unrelated':[]}
+    relation_terms=_slot_relation_terms(slot)
+    matched=[term for term in relation_terms if term and term in text][:10]
+    direction_terms=[]
+    if isinstance(user_direction,dict):
+        direction_terms=[x for x in user_direction.get('accepted') or [] if x and x in text]
+    broad_terms=('场景','构图','背景','氛围','镜头','光线','布局','排版','留白','主体','角度','比例','信息层级',
+                 '风格','清爽','浅色','明亮','高端','酒店感','极简','治愈')
+    broad=[term for term in broad_terms if term in text]
+    related=bool(matched or direction_terms or broad)
+    unrelated=[]
+    if not related:
+        unrelated=[text[:120]]
+    return {'related':related,'matched':list(dict.fromkeys(matched+direction_terms+broad))[:12],'unrelated':unrelated}
+
+def _user_direction_for_slot(direction, slot):
+    """Keep only safe global user direction that is relevant to this image slot."""
+    direction=direction if isinstance(direction,dict) else {}
+    accepted=[]; rejected=list(direction.get('rejected') or []); ignored=[]; matched=[]
+    items=direction.get('items') or [
+      {'text':value,'status':'accepted','scope':'visual','reason':''} for value in direction.get('accepted') or []
+    ]
+    for item in items:
+        if not isinstance(item,dict) or item.get('status')!='accepted': continue
+        text=str(item.get('text') or '').strip()
+        if not text: continue
+        if item.get('scope')=='product':
+            accepted.append(text)
+            matched.append('用户明确商品设定')
+            continue
+        relation=_prompt_edit_relevance(text,slot)
+        if relation.get('related'):
+            accepted.append(text)
+            matched.extend(relation.get('matched') or [])
+        else:
+            ignored.append(text)
+    return {
+      'raw':direction.get('raw') or '',
+      'accepted':list(dict.fromkeys(accepted))[:6],
+      'rejected':list(dict.fromkeys(rejected))[:6],
+      'ignored':list(dict.fromkeys(ignored))[:6],
+      'productOverrides':list(dict.fromkeys(
+        [x for x in accepted if x in (direction.get('productOverrides') or [])]
+      ))[:6],
+      'items':items,
+      'matched':list(dict.fromkeys(matched))[:12],
+      'blockedTerms':direction.get('blockedTerms') or []
+    }
+
+def _collect_prompt_product_overrides(prompt_overrides, blocked_terms=()):
+    """Extract safe product changes from per-slot edits for the shared image set."""
+    overrides=[]
+    if not isinstance(prompt_overrides,dict): return overrides
+    for value in prompt_overrides.values():
+        direction=_image_user_direction(value,blocked_terms)
+        overrides.extend(direction.get('productOverrides') or [])
+    return list(dict.fromkeys(overrides))[:12]
+
+def _apply_product_overrides(direction, overrides):
+    """Promote product changes from any input surface into the shared direction."""
+    direction=dict(direction or {}) if isinstance(direction,dict) else {}
+    for key in ('accepted','rejected','ignored','items','productOverrides','matched','blockedTerms'):
+        value=direction.get(key)
+        direction[key]=list(value) if isinstance(value,list) else []
+    existing=set(direction.get('productOverrides') or [])
+    for value in overrides or []:
+        text=str(value or '').strip()
+        if not text or text in existing: continue
+        existing.add(text)
+        direction['productOverrides'].append(text)
+        if text not in direction['accepted']:
+            direction['accepted'].append(text)
+        direction['items'].append({'text':text,'status':'accepted','scope':'product','reason':'','source':'per_slot'})
+    direction['productOverrides']=direction['productOverrides'][:12]
+    direction['accepted']=list(dict.fromkeys(direction['accepted']))[:12]
+    return direction
+
+def merge_image_prompt_with_user_edit(base_prompt, edit_text, slot, user_direction=None):
+    """Fuse per-image user edits with the built-in visual strategy only when relevant."""
+    edit=_prompt_override(edit_text)
+    if not edit:
+        return base_prompt, {'mode':'builtin','related':False,'matched':[],'ignored':[]}
+    blocked_terms=((user_direction or {}).get('blockedTerms') or ()) if isinstance(user_direction,dict) else ()
+    edit_direction=_image_user_direction(edit,blocked_terms)
+    accepted_edits=edit_direction.get('accepted') or []
+    product_edits=edit_direction.get('productOverrides') or []
+    visual_edits=[value for value in accepted_edits if value not in product_edits]
+    visual_text='；'.join(visual_edits)
+    visual_relevance=_prompt_edit_relevance(visual_text,slot,user_direction) if visual_text else {'related':False,'matched':[],'unrelated':[]}
+    related=bool(product_edits or visual_relevance.get('related'))
+    safe_parts=list(product_edits)
+    if visual_relevance.get('related'):
+        safe_parts.extend(visual_edits)
+    safe_edit='；'.join(list(dict.fromkeys(safe_parts)))
+    relevance={
+      'related':related,
+      'matched':list(dict.fromkeys((['用户明确商品设定'] if product_edits else [])+list(visual_relevance.get('matched') or [])))[:12],
+      'unrelated':list(visual_relevance.get('unrelated') or [])
+    }
+    if not relevance.get('related'):
+        guard="\n\n【单图用户编辑未采纳】用户编辑内容与本张图片策划任务、主题、卖点、场景或构图没有明确关联；本图继续执行内置策划，不替换当前图片任务。"
+        ignored=list(dict.fromkeys((edit_direction.get('rejected') or [])+(relevance.get('unrelated') or [])))[:6]
+        return base_prompt+guard, {'mode':'ignored_unrelated','related':False,'matched':[],'ignored':ignored}
+    accepted='；'.join((user_direction or {}).get('accepted') or []) if isinstance(user_direction,dict) else ''
+    merged=f'''【每张图用户编辑提示词｜当前图片相关，优先执行】
+    {safe_edit}
+
+【联合分析与自动优化规则】
+以上用户编辑内容已判断与当前图片策划相关：{('；'.join(relevance.get('matched') or []) or '与场景/构图/表达方向相关')}。
+请以用户编辑内容为最高优先级，自动融合到本张图的商品设定、主题、构图、场景、氛围、镜头、排版或表达重点中；如果它与报告事实、参考图或内置策划细节发生冲突，优先满足用户明确指定的内容。
+{('当前全局用户补充要求也需优先兼容：'+accepted+'。') if accepted else ''}
+
+【内置关联提示词｜必须继承】
+{base_prompt}
+
+【不可覆盖约束】
+用户明确指定的商品变化必须执行；用户未指定的字段继续保持默认基准。仅禁止品牌Logo、价格、销量、认证、二维码、水印、交易承诺及其他平台禁区内容。
+'''
+    ignored=list(dict.fromkeys((edit_direction.get('rejected') or [])+(relevance.get('unrelated') or [])))[:6]
+    return merged, {'mode':'applied','related':True,'matched':relevance.get('matched') or [],'ignored':ignored}
+
+def _slot_definitions(asset_type):
+    return MAIN_VISUAL_TASKS if asset_type=='main' else DETAIL_VISUAL_TASKS
+
+def build_identity_lock(report, plan, user_direction=None):
+    """Create one shared product baseline plus the user's final overrides."""
+    facts=report.get('facts') or {}; product=facts.get('product') or {}
+    attrs=facts.get('attributes') or []
+    title=str(product.get('title') or '商品').strip()
+    brand=str(product.get('brand') or '').strip()
+    blocked_terms=_report_visual_identity_terms(report)
+    fields=[]
+    if isinstance(attrs,dict):
+        fields=[f'{k}={v}' for k,v in attrs.items() if str(v).strip() and _visual_clean(f'{k}={v}',18,blocked_terms)][:12]
+    else:
+        fields=[f"{x.get('name')}={x.get('value')}" for x in attrs if isinstance(x,dict) and x.get('name') and x.get('value') and _visual_clean(f"{x.get('name')}={x.get('value')}",18,blocked_terms)][:12]
+    selling=[text for x in (plan or {}).get('sellingPoints',[]) if isinstance(x,dict) for text in _visual_clean(x.get('slogan') or x.get('consumerValue'),32,blocked_terms)][:5]
+    user_overrides=list(dict.fromkeys(
+      (user_direction or {}).get('productOverrides') or []
+    )) if isinstance(user_direction,dict) else []
+    identity_text='|'.join([title,brand,';'.join(fields),';'.join(selling),';'.join(user_overrides)])
+    identity_id='identity_'+hashlib.sha256(identity_text.encode('utf-8')).hexdigest()[:12]
+    return {
+      'id':identity_id,'productName':title,'brand':brand,'verifiedFacts':fields,
+      'userOverrides':user_overrides,
+      'sellingPoints':selling,
+      'mustKeep':['商品品类','用户未明确修改的商品字段','同一套图片共享同一最终商品设定'],
+      'mustNotChange':['品牌Logo、价格、销量、水印或二维码','认证、专利、授权及其他未证实平台宣称','用户未明确要求的额外商品变化']
+    }
+
+def build_generation_slots(report, plan):
+    """Derive a complete, ordered image set from the analysis output."""
+    exp=report.get('experienceSolution') or {}
+    visual=exp.get('visualCommerce') or {}
+    detail=exp.get('detailCommerce') or {}
+    main_items=[x for x in (visual.get('items') or []) if isinstance(x,dict)]
+    detail_items=[x for x in (detail.get('contentGroups') or []) if isinstance(x,dict)]
+    selling=[x for x in (plan or {}).get('sellingPoints',[]) if isinstance(x,dict)]
+    if not main_items:
+        main_items=[{'imageRole':'主商品全貌','visualSignals':_text_list(x.get('slogan') or x.get('consumerValue')),'nextAction':'完整展示商品与核心卖点'} for x in selling[:5]]
+    if not main_items: main_items=[{'imageRole':'主商品全貌','visualSignals':['商品主体完整'],'nextAction':'完整展示商品'}]
+    if not detail_items:
+        detail_labels=['场景证明','材质证明','结构工艺','功能表现','规格适配','使用维护']
+        detail_items=[{
+            'type':label,
+            'visualSignals':_text_list(x.get('slogan') or x.get('consumerValue')),
+            'businessMeaning':x.get('consumerValue',''),
+            'nextAction':x.get('productAction','')
+        } for label,x in zip(detail_labels,selling)]
+    if not detail_items:
+        detail_items=[{
+            'type':definition['role'],
+            'visualSignals':list(definition['signals']),
+            'nextAction':definition['nextAction']
+        } for definition in DETAIL_VISUAL_TASKS]
+    valid_ids={x.get('id') for x in (report.get('evidenceLedger') or []) if isinstance(x,dict)}
+    blocked_terms=_report_visual_identity_terms(report)
+
+    def make_slots(asset_type, source_items, max_count):
+        definitions=_slot_definitions(asset_type)
+        image_group='main' if asset_type=='main' else 'detail'
+        image_ids=[f'IMG_{image_group.upper()}_{i:04d}' for i,_ in enumerate(((report.get('facts') or {}).get('images') or {}).get(image_group,[]) or [],1)]
+        # Expose the full selectable task set. Users may pick any subset; detail
+        # tasks deliberately extend to 15 evidence positions.
+        count=min(max_count,len(definitions))
+        used_source=set();used_signals=set();result=[]
+        for index in range(count):
+            definition=definitions[index]
+            eid=image_ids[index] if index<len(image_ids) else ''
+            source=None;source_index=None
+            if eid:
+                for candidate_index,candidate in enumerate(source_items):
+                    if candidate.get('imageEvidenceId')==eid or candidate.get('representativeImageId')==eid:
+                        source=candidate;source_index=candidate_index;break
+            if source is None:
+                for candidate_index,candidate in enumerate(source_items):
+                    if candidate_index not in used_source:
+                        source=candidate;source_index=candidate_index;break
+            if source_index is not None:used_source.add(source_index)
+            refs=[]
+            if isinstance(source,dict):
+                refs.extend(x for x in source.get('evidenceIds',[]) or [] if x in valid_ids)
+                refs.extend(x for x in source.get('imageEvidenceIds',[]) or [] if x in valid_ids)
+                for key in ('imageEvidenceId','representativeImageId'):
+                    if source.get(key) in valid_ids:refs.append(source.get(key))
+            if eid in valid_ids:refs.append(eid)
+            refs=list(dict.fromkeys(refs))
+            source_signals=_visual_clean(source.get('visualSignals') if source else [],18,blocked_terms)
+            source_signals=[x for x in source_signals if any(word in x for word in definition['keywords'])]
+            source_signals=[x for x in source_signals if x not in used_signals]
+            used_signals.update(source_signals)
+            task=list(dict.fromkeys(list(definition['signals'])+source_signals))[:4]
+            result.append({
+                'assetType':asset_type,'index':index+1,'contentKey':definition['contentKey'],
+                'role':definition['role'],'task':task,'nextAction':definition['nextAction'],
+                'planName':_text_list((plan or {}).get('name'))[0] if _text_list((plan or {}).get('name')) else '新品方案',
+                'planSubtitle':_text_list((plan or {}).get('sourceType'))[0] if _text_list((plan or {}).get('sourceType')) else '产品新方案',
+                'planProductAction':_visual_clean((plan or {}).get('productAction'),45,blocked_terms),
+                'planPageAction':_visual_clean((plan or {}).get('pageAction'),36,blocked_terms),
+                'handoff':f"本图完成{definition['role']}后，继续进入下一项产品证明",
+                'avoidTopics':['其他图片已承担的卖点','品牌/专利/授权/物流/交易信息'],
+                'evidenceIds':refs
+            })
+        return result
+
+    # 主图最多 5 张；详情图提供最多 15 个可选证明位。
+    return make_slots('main',main_items,5)+make_slots('detail',detail_items,15)
+
+def resolve_reference_images(report, plan, requested=None):
+    """Resolve real image inputs: user upload > first collected main image."""
+    uploads=[]
+    for value in requested or []:
+        value=str(value or '').strip()
+        if not value: continue
+        if value.startswith('data:image/'):
+            if len(value)>12*1024*1024: raise ValueError('单张参考图不能超过 9MB')
+            uploads.append(value)
+        elif value.startswith(('http://','https://')):
+            uploads.append(value)
+        else:
+            raise ValueError('参考图必须是图片文件或 HTTPS 图片地址')
+    if uploads: return uploads[:4],'uploaded'
+    ledger=[x for x in (report.get('evidenceLedger') or []) if isinstance(x,dict) and x.get('type')=='image']
+    def usable(item):
+        if not item:return ''
+        meta=item.get('meta') or {}
+        candidates=[meta.get('sourceUrl'),item.get('value'),meta.get('localUrl')]
+        return next((str(x) for x in candidates if str(x or '').startswith(('http://','https://','data:image/'))),'')
+    first=next((usable(x) for x in ledger if (x.get('meta') or {}).get('group')=='main' and usable(x)), '')
+    if first:return [first],'first_main'
+    raise ValueError('没有可用的商品主图，请先上传产品参考图')
+
+def image_reference_mode(reference_source, fission_pattern=False, slot=None):
+    """Use the same per-slot reference rule in prompt preview and execution."""
+    if reference_source=='uploaded': return 'uploaded_reference'
+    if not fission_pattern: return 'collected_reference'
+    slot=slot if isinstance(slot,dict) else {}
+    return 'fission_base' if slot.get('assetType')=='main' and slot.get('index')==1 else 'fission_followup'
+
+def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=None, user_direction=None, product_reference_mode='collected_reference', identity_lock=None):
+    """Turn one evidence-backed visual task into a platform-aware image brief."""
+    facts=report.get('facts') or {}; product=facts.get('product') or {}
+    attrs=facts.get('attributes') or report.get('attributes') or {}
+    title=str(product.get('title') or report.get('product',{}).get('title') or '商品')
+    brand=str(product.get('brand') or '').strip()
+    category=str(product.get('category') or report.get('product',{}).get('category') or '电商商品')
+    audience=str(product.get('audience') or product.get('target') or '')
+    plan=plan if isinstance(plan,dict) else {}
+    slot=slot if isinstance(slot,dict) else {}
+    role=((report.get('roleOutputs') or {}).get('visualDesign') or {})
+    blocked_terms=_report_visual_identity_terms(report)
+    user_direction=user_direction if isinstance(user_direction,dict) else _image_user_direction(user_direction,blocked_terms)
+    lock=identity_lock if isinstance(identity_lock,dict) else build_identity_lock(report,plan,user_direction)
+    signals=_visual_clean(slot.get('task'),18,blocked_terms)
+    style=_visual_clean(role.get('styleSignals'),18,blocked_terms)+_visual_clean(role.get('fashionThesis'),18,blocked_terms)
+    params=[]
+    if isinstance(attrs,dict):
+        params=[f'{k}：{v}' for k,v in list(attrs.items())[:8] if str(v).strip() and _visual_clean(f'{k}：{v}',18,blocked_terms)]
+    elif isinstance(attrs,list):
+        params=[f"{x.get('name')}：{x.get('value')}" for x in attrs if isinstance(x,dict) and x.get('value') and _visual_clean(f"{x.get('name')}：{x.get('value')}",18,blocked_terms)][:8]
+    if asset_type=='detail':
+        proof='；'.join(signals) or '围绕当前详情任务给出产品证明'
+        composition='天猫详情页长图，纵向信息分区，只展示当前任务对应的产品证据；主图已经讲清的内容不再重复，每区留出清晰中文排版空间'
+        size='1024x1536'
+        goal='详情图：把一个购买疑问变成可验证的视觉证明，信息顺序清晰，适合移动端连续浏览'
+    else:
+        proof='；'.join(signals) or '突出商品主体与真实使用场景'
+        composition='天猫首屏主图，商品主体占画面60-80%，单一核心卖点，强对比但不堆叠文字；干净背景、主体完整、移动端缩略图仍可识别'
+        size='1024x1024'
+        goal='主图：0.5秒内让用户看懂是什么、为什么值得点、是否适合自己'
+    visual_title=_visual_title(title,brand,blocked_terms)
+    product_name=f'''商品默认身份：{visual_title}。仅用于确定起始商品，不把身份信息当成画面卖点。'''
+    plan_name=[str(plan.get('name') or '').strip()[:40]] if str(plan.get('name') or '').strip() else []
+    plan_subtitle=_visual_clean(plan.get('sourceType'),12,blocked_terms)
+    product_action=_visual_clean(plan.get('productAction'),45,blocked_terms)
+    page_action=_visual_clean(plan.get('pageAction'),36,blocked_terms)
+    plan_rule=f"产品新方案：{(plan_name or ['新品方案'])[0]}；方案副标题：{(plan_subtitle or ['产品新方案'])[0]}；产品必须落实：{'；'.join(product_action) or '以已确认商品事实为基础形成明确差异'}；整套图片必须落实：{'；'.join(page_action) or '主图提出购买理由，详情逐项完成证据证明'}。"
+    slot_rule=f"本套图中的第{slot.get('index')}个{asset_type}位：{slot.get('role') or '通用'}；唯一任务：{'；'.join(signals) or '保持商品主体清晰'}；承接：{slot.get('handoff') or slot.get('nextAction') or '不偏离当前产品证明'}。"
+    accepted=user_direction.get('accepted') or []
+    product_overrides=user_direction.get('productOverrides') or []
+    user_rule=f"【最高优先级用户输入】以下内容是本次图片的最终创作要求，优先级高于报告事实、参考图默认外观、自动生成的新品方案、当前图片默认任务和其他默认提示；用户明确指定的材质、颜色、结构、件数、尺寸、规格、花型、款式、功能或视觉表达必须执行：{'；'.join(accepted)}。" if accepted else ''
+    product_rule=f"【用户最终商品设定｜整套图片共享】用户明确修改的商品字段覆盖报告默认字段和参考图默认外观，所有主图、详情图及裂变基准图必须统一执行：{'；'.join(product_overrides)}。" if product_overrides else ''
+    rejected=user_direction.get('rejected') or []
+    ignored=user_direction.get('ignored') or []
+    rejected_rule=f"仅拦截的用户要求：{'；'.join(rejected)}。原因：涉及品牌、交易、认证或平台禁区；其他商品和视觉修改要求不因改变报告基准而被拦截。" if rejected else ''
+    ignored_rule=f"本图未采纳的用户要求：{'；'.join(ignored)}。原因：与本张图片的内策划任务、主题或证明重点没有明确关联。" if ignored else ''
+    benchmark_rule=f"爆款商品特征借鉴：结合本方案方向“{(plan_subtitle or ['产品新方案'])[0]}”，借鉴爆款主图/详情图的高转化结构、主体占比、场景钩子、证明顺序和信息层级；只借鉴表达方法，不复制对标商品外观、品牌、Logo、原文文案或未证实卖点。"
+    reference_modes={
+      'uploaded_reference':'产品默认参考：用户上传图片用于确定起始商品外观；用户明确指定的商品变化优先覆盖上传图对应字段。',
+      'fission_base':'产品默认参考：先基于采集商品主图生成新品基准图；用户明确指定的商品变化优先执行，并作为整套图片的最终商品设定。',
+      'fission_followup':'产品默认参考：随请求提供的图片是上一张生成结果；本图继续保持用户最终指定的商品设定和整套图片一致。',
+      'collected_reference':'产品默认参考：以采集商品主图作为起始商品参考；用户明确指定的商品变化优先覆盖参考图对应字段。'
+    }
+    reference_rule=reference_modes.get(product_reference_mode,reference_modes['collected_reference'])
+    base_prompt=f'''为中国电商平台生成第{variant_index+1}版{asset_type}图片。{goal}。
+【统一产品身份锁｜{lock['id']}】
+本任务必须与同一套图片保持产品完全一致。已确认产品事实：{'；'.join(lock['verifiedFacts']) or '以采集到的商品外观为准'}。
+必须保持：{'、'.join(lock['mustKeep'])}。禁止改变：{'、'.join(lock['mustNotChange'])}。
+每张图默认以随请求提供的商品主图/上传参考图为起始外观基准；用户最终商品设定可以覆盖对应字段，未指定的字段继续保持同一商品设定。
+{product_name}
+{reference_rule}
+{user_rule}
+{product_rule}
+{rejected_rule}
+{ignored_rule}
+{plan_rule}
+{benchmark_rule}
+{slot_rule}
+类目：{category}；目标人群/场景：{audience or '以采集到的商品页面与推荐方案为准'}。
+报告默认页面信息（仅对未被用户明确修改的字段生效，不得覆盖用户最终商品设定）：{'; '.join(params) or '以商品外观为准'}。
+{f"用户最终商品设定已覆盖对应默认字段：{'；'.join(product_overrides)}。" if product_overrides else ''}
+视觉信号/证明任务：{proof}。
+视觉参考：{'；'.join(style) or '克制、真实、质感清晰'}。
+构图要求：{composition}。本图尺寸比例：{size}。如果画面出现商品局部、套件、包装或场景，必须与用户最终指定的商品设定相互对应，不得擅自引入用户未要求的其他商品变化。
+【最终优先级】用户明确输入 > 报告默认事实与默认参考图 > 新品方案细节 > 当前图片默认表达；用户未明确修改的字段继续遵循报告事实和当前图片唯一任务。平台合规要求始终有效。
+硬性禁止：不要出现任何品牌或商标字样、专利、授权、认证、奖项、价格、销量、促销、物流、客服、售后、二维码或防伪信息；不要生成水印、乱码或英文占位字；不使用竞品元素；不裁切商品主体；不要擅自增加用户未要求的额外商品变化；用户明确要求的材质、颜色、结构、件数、尺寸、规格、花型、款式或功能变化必须执行；文字少而大，若无法可靠渲染中文则留白给后期排版。
+'''
+    return build_image_generation_prompt(base_prompt)
+
+def _load_report_for_generation(data):
+    if not isinstance(data,dict): raise ValueError('生图请求必须是 JSON 对象')
+    direct=data.get('reportData')
+    if isinstance(direct,dict): return direct
+    source=str(data.get('source') or '')
+    if not source: raise ValueError('缺少 report source')
+    path=source.split('?',1)[0]
+    if path.startswith('/reports/'): path=path[len('/reports/'):]
+    target=(REPORTS/path).resolve()
+    if REPORTS.resolve() not in target.parents or target.suffix!='.json': raise ValueError('report source 不在本地报告目录')
+    if not target.exists(): raise FileNotFoundError('报告文件不存在')
+    obj=json.loads(target.read_text('utf-8'))
+    if not isinstance(obj,dict): raise ValueError('报告数据格式错误')
+    return obj
+
+def _persist_image_job(job_id, state):
+    """Checkpoint image work after every asset so a restart never hides returned images."""
+    payload=dict(state or {})
+    payload['jobId']=job_id
+    (REPORTS/f'generated_{job_id}.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),'utf-8')
+
+def _generation_worker(job_id, report, request):
+    try:
+        exp=report.get('experienceSolution') or {}; plans=(exp.get('newProductPlans') or {}).get('plans') or report.get('launchPlans',{}).get('plans') or []
+        plan=plans[int(request.get('planIndex',0))] if plans and 0<=int(request.get('planIndex',0))<len(plans) else (plans[0] if plans else {})
+        reference_images,reference_source=resolve_reference_images(report,plan,request.get('referenceImages'))
+        fission_pattern=bool(request.get('fissionPattern', reference_source!='uploaded')) and reference_source!='uploaded'
+        prompt_overrides=request.get('promptOverrides') if isinstance(request.get('promptOverrides'),dict) else {}
+        blocked_terms=_report_visual_identity_terms(report)
+        user_direction=_image_user_direction(request.get('userDirection'),blocked_terms)
+        user_direction=_apply_product_overrides(
+            user_direction,
+            _collect_prompt_product_overrides(prompt_overrides,blocked_terms),
+        )
+        identity_lock=build_identity_lock(report,plan,user_direction)
+        slots=build_generation_slots(report,plan)
+        types=request.get('assetTypes') or ['main','detail']; types=[x for x in types if x in ('main','detail')][:2] or ['main','detail']
+        complete_set=bool(request.get('completeSet',True))
+        selected_keys={str(x) for x in request.get('selectedSlots',[]) if isinstance(x,(str,int))}
+        if complete_set:
+            selected_slots=[slot for slot in slots if slot['assetType'] in types and (not selected_keys or f"{slot['assetType']}:{slot['index']}" in selected_keys)]
+        else:
+            try: count=max(1,min(6,int(request.get('count',1))))
+            except Exception: count=1
+            selected_slots=[{'assetType':asset_type,'index':i+1} for asset_type in types for i in range(count)][:12]
+        if fission_pattern and not any(slot.get('assetType')=='main' and slot.get('index')==1 for slot in selected_slots):
+            base_slot=next((slot for slot in slots if slot.get('assetType')=='main' and slot.get('index')==1), None)
+            if base_slot:
+                selected_slots=[base_slot]+selected_slots
+        if not selected_slots: raise ValueError('请至少选择一张要生成的图片')
+        root=GENERATED_ASSET_ROOT/job_id; root.mkdir(parents=True,exist_ok=True); results=[]
+        total=len(selected_slots); done=0
+        user_direction_by_slot={
+          f"{slot.get('assetType')}:{slot.get('index')}":_user_direction_for_slot(user_direction,slot)
+          for slot in selected_slots
+        }
+        state=IMAGE_JOBS.setdefault(job_id,{})
+        state.update({'jobId':job_id,'status':'generating','progress':20,'results':results,
+                      'planName':plan.get('name') or '未命名开品方案','productName':identity_lock.get('productName') or '商品',
+                      'reportSource':str(request.get('source') or ''),'assetTypes':types,'completeSet':complete_set,
+                      'expectedSlots':selected_slots,'referenceSource':reference_source,'referenceCount':len(reference_images),
+                      'userDirection':user_direction,'userDirectionBySlot':user_direction_by_slot,
+                      'fissionPattern':fission_pattern})
+        _persist_image_job(job_id,state)
+        result_lock=threading.Lock()
+        def generate_slot(order_slot, refs, reference_mode):
+            order,slot=order_slot
+            asset_type=slot['assetType']; i=slot.get('index',order+1)-1
+            prompt_key=f"{asset_type}:{slot.get('index')}"
+            slot_direction=user_direction_by_slot.get(prompt_key) or _user_direction_for_slot(user_direction,slot)
+            base_prompt=build_image_prompt(report,plan,asset_type,i,slot,slot_direction,reference_mode,identity_lock)
+            prompt,prompt_merge=merge_image_prompt_with_user_edit(base_prompt,prompt_overrides.get(prompt_key),slot,slot_direction)
+            response=image_generate(prompt,size='1024x1536' if asset_type=='detail' else '1024x1024',n=1,reference_images=refs)
+            entries=response.get('data') if isinstance(response,dict) else None
+            if not isinstance(entries,list) or not entries: raise ValueError('图片接口返回为空')
+            saved=_save_generated_item(entries[0],root,order+1)
+            saved.update({'assetType':asset_type,'slotIndex':slot.get('index'),'slotRole':slot.get('role',''),'slotTask':slot.get('task',[]),'prompt':prompt,'planName':plan.get('name') or '',
+                          'promptMerge':prompt_merge,'userDirection':slot_direction,
+                          'consistencyGroupId':identity_lock['id'],'identityLock':identity_lock})
+            return saved
+        ordered_slots=list(enumerate(selected_slots))
+        fission_item=next((item for item in ordered_slots if item[1].get('assetType')=='main' and item[1].get('index')==1), None) if fission_pattern else None
+        followup_refs=reference_images
+        if fission_item:
+            # The fission base is always the first persisted asset.  When the
+            # caller selected only detail slots we prepend the base above, but
+            # the original enumerate index can still be zero for the first
+            # detail item; passing an explicit zero here and reindexing the
+            # remaining slots below prevents both assets from overwriting
+            # ``01.png``.
+            saved=generate_slot((0,fission_item[1]),reference_images,image_reference_mode(reference_source,True,fission_item[1]))
+            results.append(saved); done+=1
+            base_ref=_generated_item_data_url(saved) or saved.get('sourceUrl') or (reference_images[0] if reference_images else '')
+            followup_refs=[base_ref] if base_ref else reference_images
+            IMAGE_JOBS[job_id].update(progress=20+int(done/total*75),results=results,productBaseImage=saved.get('url'))
+            _persist_image_job(job_id,IMAGE_JOBS[job_id])
+            remaining_slots=[item[1] for item in ordered_slots if item[0]!=fission_item[0]]
+            # Follow-up filenames start at 02.png and remain stable even when
+            # the base was injected into a request that selected only details.
+            ordered_slots=[(index,slot) for index,slot in enumerate(remaining_slots,start=1)]
+        with ThreadPoolExecutor(max_workers=max(1,len(ordered_slots))) as image_pool:
+            futures=[image_pool.submit(generate_slot,item,followup_refs,image_reference_mode(reference_source,fission_pattern,item[1])) for item in ordered_slots]
+            for future in as_completed(futures):
+                saved=future.result()
+                with result_lock:
+                    results.append(saved)
+                    done+=1; IMAGE_JOBS[job_id].update(progress=20+int(done/total*75),results=results)
+                    _persist_image_job(job_id,IMAGE_JOBS[job_id])
+        meta={'jobId':job_id,'status':'complete','progress':100,'results':results,'planName':plan.get('name') or '未命名开品方案',
+              'productName':identity_lock.get('productName') or '商品','reportSource':str(request.get('source') or ''),
+              'createdAt':IMAGE_JOBS.get(job_id,{}).get('createdAt') or time.time(),'completedAt':time.time(),
+              'assetTypes':types,'completeSet':complete_set,'expectedSlots':selected_slots,'referenceSource':reference_source,'referenceCount':len(reference_images),
+              'userDirection':user_direction,'userDirectionBySlot':user_direction_by_slot,'fissionPattern':fission_pattern,'consistencyGate':{
+                'status':'needs_review','groupId':identity_lock['id'],
+                'message':'主图与详情图共享同一产品身份锁；正式发布前需做商品结构、颜色、材质、规格与文案复核。',
+                'checks':['product_identity_shared','plan_constraints_shared','platform_rules_embedded']
+              }}
+        _persist_image_job(job_id,meta); IMAGE_JOBS[job_id]=meta
+    except Exception as e:
+        IMAGE_JOBS[job_id].update(status='error',progress=100,error=str(e),completedAt=time.time())
+        try: _persist_image_job(job_id,IMAGE_JOBS[job_id])
+        except Exception: pass
 
 def jdump(o): return json.dumps(o,ensure_ascii=False).encode('utf-8')
 
@@ -329,12 +963,30 @@ def save_config(data):
       'api_key':key,
       'model':str(data.get('model') or old.get('model') or 'gpt-5.5').strip(),
       'chat_path':'/chat/completions','models_path':'/models','temperature':0.2,'timeout':120,'retries':2,
-      'ssl_verify':True,'ca_bundle':'','extra_headers':{}
+      'ssl_verify':True,'ca_bundle':'','extra_headers':{},
+      'image_model':str(data.get('image_model') or old.get('image_model') or '').strip(),
+      'image_api_base':str(data.get('image_api_base') or old.get('image_api_base') or '').strip().rstrip('/'),
+      'image_api_key':str(data.get('image_api_key') or old.get('image_api_key') or '').strip(),
+      'image_path':str(data.get('image_path') or old.get('image_path') or '/images/generations').strip(),
+      'image_models_path':str(data.get('image_models_path') or old.get('image_models_path') or '/models').strip(),
+      'image_size':str(data.get('image_size') or old.get('image_size') or '1024x1024').strip(),
+      'image_quality':str(data.get('image_quality') or old.get('image_quality') or '').strip(),
+      # Preserve an optional provider style hint even though the compact
+      # settings page does not expose it as a separate input.
+      'image_style':str(data.get('image_style') or old.get('image_style') or '').strip(),
     }
     tmp=p.with_suffix('.json.tmp')
     tmp.write_text(json.dumps(cfg,ensure_ascii=False,indent=2),'utf-8')
     tmp.replace(p)
     return cfg
+
+def _image_channel_label(config):
+    """Describe field-level fallback without exposing any API credential."""
+    image_base_set=bool(str((config or {}).get('image_api_base') or '').strip())
+    image_key_set=bool(str((config or {}).get('image_api_key') or '').strip())
+    if image_base_set and image_key_set: return '独立生图渠道'
+    if image_base_set or image_key_set: return '混合继承（部分字段复用分析渠道）'
+    return '复用分析渠道'
 
 def control_page():
     global MODEL_PROBE, MODEL_PROBE_AT
@@ -344,20 +996,48 @@ def control_page():
     api_ok=bool(MODEL_PROBE.get('ok'))
     base=html.escape(str(c.get('api_base') or 'https://api.bananarouter.com/v1'))
     model=html.escape(str(c.get('model') or 'gpt-5.5'))
+    image_base=html.escape(str(c.get('image_api_base') or ''))
+    image_model=html.escape(str(c.get('image_model') or ''))
+    image_path=html.escape(str(c.get('image_path') or '/images/generations'))
+    image_models_path=html.escape(str(c.get('image_models_path') or '/models'))
+    effective_image_base=str(c.get('image_api_base') or c.get('api_base') or '').rstrip('/')
+    effective_image_path=str(c.get('image_path') or '/images/generations')
+    image_endpoint=html.escape((effective_image_base+'/'+effective_image_path.lstrip('/')) if effective_image_base else '未配置')
+    image_channel_label=_image_channel_label(c)
+    image_cfg=bool(str(c.get('image_model') or '').strip())
+    effective_image_key=str(c.get('image_api_key') or c.get('api_key') or '').strip()
+    image_ready=bool(image_cfg and effective_image_base and effective_image_key and not effective_image_key.startswith('YOUR_'))
+    request_timeout=html.escape(str(c.get('timeout') or 120))
+    request_retries=html.escape(str(c.get('retries') if c.get('retries') is not None else 2))
+    # The status card reports credential readiness without exposing a key. The
+    # provider/model list probe below remains the source of truth for reachability.
+    image_ok=image_ready
     cfg_err=html.escape(str(c.get('_config_error') or ''))
     probe=html.escape(str(MODEL_PROBE.get('error') or ''))
     key_state='已保存' if str(c.get('api_key') or '').strip() and not str(c.get('api_key')).startswith('YOUR_') else '未填写'
+    image_key_state='已单独保存' if str(c.get('image_api_key') or '').strip() else '未单独填写，当前复用分析渠道 Key'
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>三笙 · 电商商品分析闭环 V{SERVER_VERSION}</title><style>
-    *{{box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5faf9;color:#10191d;margin:0}}.wrap{{max-width:900px;margin:54px auto;padding:0 24px}}.hero{{background:#071114;color:#fff;padding:34px;border-radius:22px;border-top:5px solid #00cdb0}}h1{{font-size:38px;margin:0 0 10px}}.sub{{color:#b9d0d4}}.card{{margin-top:18px;background:#fff;border:1px solid #dbe8e8;border-radius:18px;padding:24px}}.status{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.pill{{padding:14px;border-radius:12px;background:#eef9f7;font-weight:700}}.ok{{color:#008c78}}.bad{{color:#c54552}}label{{display:block;font-size:13px;font-weight:700;margin:16px 0 7px}}input{{width:100%;padding:13px 14px;border:1px solid #bcd8d6;border-radius:10px;font-size:15px}}button{{margin-top:18px;border:0;border-radius:10px;padding:13px 18px;background:linear-gradient(110deg,#00cdb0,#008fd8);color:white;font-weight:800;font-size:15px;cursor:pointer}}button.secondary{{background:#071114;margin-left:8px}}#msg{{margin-top:12px;white-space:pre-wrap}}code{{background:#eaf7f5;padding:3px 6px;border-radius:5px}}@media(max-width:700px){{.status{{grid-template-columns:1fr}}}}
+    *{{box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5faf9;color:#10191d;margin:0}}.wrap{{max-width:1160px;margin:54px auto;padding:0 24px 60px}}.hero{{background:#071114;color:#fff;padding:34px;border-radius:22px;border-top:5px solid #00cdb0}}h1{{font-size:38px;margin:0 0 10px}}h2{{letter-spacing:-.02em}}.sub{{color:#b9d0d4;line-height:1.65}}.card{{margin-top:18px;background:#fff;border:1px solid #dbe8e8;border-radius:18px;padding:24px}}.status{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.pill{{padding:14px;border-radius:12px;background:#eef9f7;font-weight:700}}.ok{{color:#008c78}}.bad{{color:#c54552}}label{{display:block;font-size:13px;font-weight:700;margin:16px 0 7px}}input{{width:100%;padding:13px 14px;border:1px solid #bcd8d6;border-radius:10px;font-size:15px}}.field-help{{display:block;margin-top:6px;color:#6f7d80;font-size:12px;line-height:1.55;overflow-wrap:anywhere}}button{{margin-top:18px;border:0;border-radius:10px;padding:13px 18px;background:linear-gradient(110deg,#00cdb0,#008fd8);color:white;font-weight:800;font-size:15px;cursor:pointer}}button.secondary{{background:#071114;margin-left:8px}}#msg{{margin-top:12px;white-space:pre-wrap}}code{{background:#eaf7f5;padding:3px 6px;border-radius:5px;color:#087465;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}a{{color:#087f70}}.section-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}}.section-head h2{{margin:4px 0 8px;font-size:28px}}.section-head p{{max-width:760px;margin:0;color:#667477;line-height:1.65}}.eyebrow{{color:#008f7a;font-size:11px;font-weight:900;letter-spacing:.14em}}.doc-link{{flex:0 0 auto;display:inline-flex;align-items:center;padding:9px 12px;border:1px solid #a9d7d0;border-radius:9px;background:#f1fbf9;font-size:12px;font-weight:800;text-decoration:none}}.workflow-card{{border-top:4px solid #00b99f}}.flow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:22px 0 0;padding:0;list-style:none;counter-reset:flow}}.flow li{{position:relative;min-height:142px;padding:15px 13px;border:1px solid #d8e7e5;border-radius:13px;background:linear-gradient(155deg,#f7fcfb,#eef8f6);counter-increment:flow}}.flow li::before{{content:"0" counter(flow);display:block;margin-bottom:18px;color:#00a58e;font-size:11px;font-weight:900;letter-spacing:.08em}}.flow li:not(:last-child)::after{{content:"→";position:absolute;z-index:2;right:-9px;top:66px;width:18px;height:18px;border:1px solid #cae2de;border-radius:50%;background:#fff;color:#008f7a;text-align:center;font-size:12px;line-height:16px}}.flow b{{display:block;margin-bottom:7px;font-size:14px}}.flow small{{display:block;color:#68777a;font-size:11px;line-height:1.55}}.code-name{{display:block;margin-top:8px;color:#087f70;font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}.runtime-strip{{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:8px;margin-top:12px}}.runtime-item{{padding:10px 12px;border-radius:10px;background:#091619;color:#d6e7e7;font-size:11px;line-height:1.5;overflow-wrap:anywhere}}.runtime-item b{{display:block;color:#27d8bd;font-size:10px;letter-spacing:.08em}}.runtime-chain{{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:#e9f7f4;color:#47605d;font-size:11px;line-height:1.6;overflow-wrap:anywhere}}.runtime-chain b{{color:#087f70;margin-right:8px}}.dev-grid{{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:14px}}.dev-panel{{border:1px solid #dbe8e8;border-radius:14px;overflow:hidden;background:#fff}}.dev-panel>header{{padding:15px 16px;background:#f5faf9}}.dev-panel h3{{margin:0 0 4px;font-size:16px}}.dev-panel header p{{margin:0;color:#6d797b;font-size:11px;line-height:1.5}}.prompt-stack{{margin:0;padding:6px 16px 14px;list-style:none;counter-reset:layer}}.prompt-stack li{{display:grid;grid-template-columns:26px 1fr;gap:8px;padding:9px 0;border-bottom:1px solid #edf3f2;counter-increment:layer}}.prompt-stack li:last-child{{border-bottom:0}}.prompt-stack li::before{{content:counter(layer);display:flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:6px;background:#e5f6f3;color:#008a76;font-size:10px;font-weight:900}}.prompt-stack b{{font-size:12px}}.prompt-stack span{{display:block;margin-top:3px;color:#6d797b;font-size:10px;line-height:1.5}}.branch-list{{margin:0;padding:7px 16px 15px;list-style:none}}.branch-list li{{padding:10px 0;border-bottom:1px solid #edf3f2;font-size:11px;line-height:1.55}}.branch-list li:last-child{{border-bottom:0}}.branch-list b{{display:block;margin-bottom:2px;color:#0b7567;font-size:12px}}.formula{{margin:0 16px 16px;padding:11px 12px;border-radius:10px;background:#071114;color:#d8e9e8;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}details.tech-detail{{min-width:0;margin-top:14px;border:1px solid #dbe8e8;border-radius:14px;background:#fff;overflow:hidden}}details.tech-detail>summary{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px;background:#f5faf9;cursor:pointer;font-size:14px;font-weight:800}}details.tech-detail>summary small{{color:#718083;font-size:11px;font-weight:500}}.table-wrap{{max-width:100%;overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-size:11px}}th,td{{padding:11px 12px;border-top:1px solid #e4eeec;text-align:left;vertical-align:top;line-height:1.55}}th{{background:#fbfdfd;color:#506063;font-size:10px;letter-spacing:.05em;white-space:nowrap}}td:first-child{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#087465;white-space:nowrap}}.callout{{margin:14px 0 0;padding:12px 14px;border-left:4px solid #00ad94;border-radius:8px;background:#edf9f7;color:#47605d;font-size:12px;line-height:1.65}}.dev-grid>*,.channel-grid>*,.channel-grid>.card{{min-width:0}}.channel-grid{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}}.channel-grid>.card{{height:max-content}}@media(max-width:980px){{.flow{{grid-template-columns:repeat(3,minmax(0,1fr))}}.flow li:nth-child(3)::after{{display:none}}.runtime-strip{{grid-template-columns:1fr 1fr}}.dev-grid,.channel-grid{{grid-template-columns:minmax(0,1fr)}}}}@media(max-width:700px){{.wrap{{margin-top:24px;padding:0 14px 40px}}h1{{font-size:30px}}.hero,.card{{padding:20px}}.status,.flow,.runtime-strip{{grid-template-columns:minmax(0,1fr)}}.flow li{{min-height:auto}}.flow li::after{{display:none!important}}.section-head{{display:block}}.doc-link{{margin-top:14px}}details.tech-detail>summary{{display:block}}details.tech-detail>summary small{{display:block;margin-top:5px}}.table-wrap{{overflow:visible}}table,thead,tbody,tr,th,td{{display:block;width:100%}}thead{{display:none}}tr{{padding:9px 12px;border-top:1px solid #e4eeec}}td,td:first-child{{display:grid;grid-template-columns:82px minmax(0,1fr);gap:8px;padding:3px 0;border:0;white-space:normal;overflow-wrap:anywhere}}td::before{{color:#718083;font:9px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}td:nth-child(1)::before{{content:"参数"}}td:nth-child(2)::before{{content:"来源 / 默认"}}td:nth-child(3)::before{{content:"作用"}}td:nth-child(4)::before{{content:"校验 / 兼容"}}button.secondary{{margin-left:0}}}}
     </style></head><body><div class="wrap"><section class="hero"><div style="font-size:12px;letter-spacing:.16em;color:#12d8bb;font-weight:800">ONE-CLICK LOCAL SERVICE</div><h1>三笙 · 电商商品分析引擎 V{SERVER_VERSION}</h1><div class="sub">单商品手动深采；类目不限，参数与SKU动态识别，评论可持续采集，也可随时基于当前数据开始分析。</div></section>
-    <section class="card"><div class="status"><div class="pill">本地服务<br><span class="ok">运行正常 · V{SERVER_VERSION}</span></div><div class="pill">模型配置<br><span class="{'ok' if is_cfg else 'bad'}">{'已配置 '+model if is_cfg else '待配置'}</span></div><div class="pill">API连接<br><span class="{'ok' if api_ok else 'bad'}">{'连通 ✓' if api_ok else '待检测/失败'}</span></div></div></section>
-    <section class="card"><h2 style="margin-top:0">首次只需要填一次 API Key</h2><p style="color:#667067">默认已为 BananaRouter + gpt-5.5 配好。API Key 只保存在本机 <code>server/config.json</code>，不会写入 Chrome 扩展。</p>
-    <label>API Base</label><input id="base" value="{base}"><label>API Key（{key_state}）</label><input id="key" type="password" placeholder="粘贴新的 sk-...；已保存时可留空"><label>模型</label><input id="model" value="{model}">
-    <button onclick="save()">保存并测试连接</button><button class="secondary" onclick="test()">仅重新测试</button><div id="msg">{'配置错误：'+cfg_err if cfg_err else ('API错误：'+probe if (is_cfg and not api_ok and probe) else '')}</div></section>
+    <section class="card"><div class="status"><div class="pill">本地服务<br><span class="ok">运行正常 · V{SERVER_VERSION}</span></div><div class="pill">分析模型<br><span class="{'ok' if is_cfg else 'bad'}">{'已配置 '+model if is_cfg else '待配置'}</span></div><div class="pill">生图模型<br><span class="{'ok' if image_ok else 'bad'}">{'已配置 '+image_model if image_cfg else '待配置'}</span></div></div></section>
+    <section class="card workflow-card" id="image-workflow"><div class="section-head"><div><span class="eyebrow">ENGINEERING MAP · REAL RUNTIME</span><h2>生图工作流 · 研发速览</h2><p>提示词工作流程与参数解释：预览与正式生成共用提示词构建逻辑，报告事实先变成逐图任务，再经过一致性守卫组成最终提示词，调用生图接口并逐张保存。下方函数名可直接用于代码定位。</p></div><a class="doc-link" href="/prompts">查看 / 编辑提示词模板 →</a></div><p class="runtime-chain"><b>前端触发链</b><code>initPlanActions</code> → <code>refreshPromptPreview</code> → <code>/api/generate-images</code> → <code>pollJob</code>；后端再按槽位调用 <code>image_generate</code>，逐张写入 manifest。</p>
+    <ol class="flow"><li><b>读取报告与方案</b><small>从报告文件或请求体读取真实商品事实，按 <code>planIndex</code> 选择“下一款方向”。</small><span class="code-name">_load_report_for_generation</span></li><li><b>拆成逐图任务</b><small>提供主图 5 位、详情图 15 位；弹窗默认选择主图 5 位 + 详情前 6 位。</small><span class="code-name">build_generation_slots</span></li><li><b>确定起始产品基准</b><small>用户上传最多 4 张优先；否则取采集到的第一张商品主图。明确的用户商品设定可覆盖对应字段。</small><span class="code-name">resolve_reference_images</span></li><li><b>组装与校验提示词</b><small>注入身份锁、报告参数、用户最终设定、方案、单图任务和禁区；视觉要求再按槽位相关性分配。</small><span class="code-name">build_image_prompt + merge_image_prompt_with_user_edit</span></li><li><b>调用生图渠道</b><small>把最终 prompt、模型、尺寸、数量和参考图发给 OpenAI-compatible 接口。</small><span class="code-name">image_generate</span></li><li><b>落盘与一致性复核</b><small>兼容 URL / Base64 返回；每完成一张即保存图片与任务清单，最后标记人工复核。</small><span class="code-name">_persist_image_job + consistencyGate</span></li></ol>
+    <div class="runtime-strip"><div class="runtime-item"><b>当前真实端点</b>{image_endpoint}</div><div class="runtime-item"><b>渠道选择</b>{html.escape(image_channel_label)}</div><div class="runtime-item"><b>固定出图尺寸</b>主图 1024×1024<br>详情图 1024×1536</div><div class="runtime-item"><b>单任务与容错</b>每槽位 n=1<br>超时 {request_timeout}s · 重试 {request_retries} 次</div></div>
+    <div class="dev-grid"><section class="dev-panel"><header><h3>最终提示词怎样组成</h3><p>这是实际拼装顺序，不展示模型的隐藏推理过程。</p></header><ol class="prompt-stack"><li><div><b>统一产品身份锁 <code>identityLock</code></b><span>报告商品与参数作为默认基准；全局明确商品修改写入 <code>productOverrides</code>，整套图共享同一最终 identityId。</span></div></li><li><div><b>参考图规则</b><span>uploaded / collected / fission 决定起始外观；用户明确指定的商品字段优先覆盖参考图对应默认字段。</span></div></li><li><div><b>全局用户方向</b><span>明确的材质、颜色、结构、规格等商品设定作用于整套图；视觉要求按槽位相关性分配；品牌、交易、认证等禁区被拦截。</span></div></li><li><div><b>开品方案与爆款表达</b><span>注入方案名称、产品动作、页面动作；只借鉴高转化表达方法，不复制竞品。</span></div></li><li><div><b>当前图片默认任务</b><span>注入 assetType、index、role、task 与 handoff；用户没有明确覆盖时，继续执行本图默认信息任务。</span></div></li><li><div><b>事实、视觉与构图约束</b><span>类目、受众、页面实采参数提供默认值；视觉信号、尺寸和平台硬性禁区共同收口。</span></div></li><li><div><b>模板包裹与单图编辑 <code>promptMerge</code></b><span><code>image_generation</code> 用 <code>{{prompt}}</code> 注入内置提示词；商品字段编辑直接提权，视觉编辑需与本图相关，不相关内容保留默认策划。</span></div></li></ol><p class="formula">basePrompt → image_generation.replace("{{prompt}}", basePrompt) → relevanceGuard(promptOverride) → finalPrompt</p></section>
+    <section class="dev-panel"><header><h3>参考图与并发分支</h3><p>是否上传参考图和“裂变花型”开关决定执行 DAG。</p></header><ul class="branch-list"><li><b>上传参考图</b>上传图作为起始产品外观；所有已选图片共享全局用户最终设定，未指定字段继续参考上传图。</li><li><b>未上传 · 普通同款</b>采集商品第一张主图作为共同起始参考，已选槽位可并行生成。</li><li><b>未上传 · 裂变花型</b>先串行生成 <code>main:1</code> 新品基准图，再把该结果作为其余槽位的共同参考并行生成。</li><li><b>没有任何可用参考图</b>预览和正式任务都会立即报错，不会无产品基准盲生图。</li><li><b>结果复核</b>系统记录共享身份设定和任务约束，但不等于视觉质检通过；发布前仍需人工核对结构、颜色、材质、规格、文字与合规。</li></ul></section></div>
+    <details class="tech-detail" open><summary>业务请求参数 <small>报告弹窗 → /api/image-prompt-preview 与 /api/generate-images</small></summary><div class="table-wrap"><table><thead><tr><th>参数</th><th>来源 / 默认</th><th>作用</th><th>校验与边界</th></tr></thead><tbody><tr><td>source / reportData</td><td>当前报告 URL 或报告 JSON</td><td>提供商品事实、证据账本、视觉分析和开品方案。</td><td>source 只能读取本地 reports 目录内的 JSON。</td></tr><tr><td>planIndex</td><td>用户选择；默认 0</td><td>决定本次执行哪一个新品方案。</td><td>必须落在实际方案数组范围内。</td></tr><tr><td>assetTypes</td><td>main / detail</td><td>决定生成主图、详情图或两者。</td><td>其他值被过滤；正式生成至少保留一种。</td></tr><tr><td>selectedSlots</td><td>例如 main:1、detail:3</td><td>精确选择要执行的图片槽位。</td><td>空值代表执行所选类型的全部槽位。</td></tr><tr><td>referenceImages</td><td>用户上传；最多 4 张</td><td>提供真实起始商品外观，不只是写进文字提示词。</td><td>用户明确商品设定可覆盖对应默认字段；单张上传限制约 9 MB。</td></tr><tr><td>userDirection</td><td>全局最终要求</td><td>既可指定商品字段，也可调整场景、构图、镜头和排版。</td><td>商品设定应用整套图；视觉要求再按槽位相关性分配；平台禁区拦截。</td></tr><tr><td>promptOverrides</td><td>按槽位保存的单图编辑</td><td>让某张图优先执行明确商品修改或相关视觉要求。</td><td>商品字段可覆盖本图默认值；视觉编辑需相关；平台禁区始终不能覆盖。</td></tr><tr><td>fissionPattern</td><td>未上传时默认开启</td><td>先产出新品基准，再保持整套裂变商品一致。</td><td>上传参考图时强制关闭。</td></tr><tr><td>completeSet</td><td>默认 true</td><td>按已计算的槽位任务生成，而非简单重复 n 张。</td><td>true 且 selectedSlots 为空时执行所选类型的全部槽位。</td></tr><tr><td>jobId / statusUrl</td><td>POST 成功返回</td><td>异步任务标识与轮询地址。</td><td>客户端按 statusUrl 查询，不阻塞当前请求。</td></tr><tr><td>GET status</td><td>/api/image-job/&lt;jobId&gt;</td><td>返回 status、progress、results、error 和 consistencyGate。</td><td>queued / generating / complete / error；完成后结果可追溯。</td></tr></tbody></table></div></details>
+    <details class="tech-detail" open><summary>生图接口参数与返回 <small>服务端 → 当前生图 API；密钥不会显示在页面</small></summary><div class="table-wrap"><table><thead><tr><th>参数</th><th>当前值 / 默认</th><th>作用</th><th>兼容策略</th></tr></thead><tbody><tr><td>model</td><td>{image_model or '未配置'}</td><td>真正写入生图请求体的模型 ID。</td><td>必填；与分析模型完全独立。</td></tr><tr><td>image_models_path</td><td>{image_models_path}</td><td>保存/测试连接时查询生图模型列表的路径。</td><td>默认 <code>/models</code>；与实际出图路径分开。</td></tr><tr><td>prompt</td><td>按上方 7 层动态组成</td><td>每张图都得到不同的最终提示词。</td><td>预览接口与正式生成共用同一拼装函数。</td></tr><tr><td>size</td><td>main 1024×1024<br>detail 1024×1536</td><td>按主图 / 详情图用途固定画布比例。</td><td>由槽位类型决定，不使用页面自由输入覆盖。</td></tr><tr><td>n</td><td>1</td><td>一次接口调用只生成当前槽位的一张图。</td><td>整套数量由 selectedSlots 决定。</td></tr><tr><td>image / reference_images / images</td><td>同一组参考图的兼容字段</td><td>把真实产品图随请求发送给生图服务。</td><td>按三种常见字段形态逐一尝试，不能静默丢弃参考图。</td></tr><tr><td>quality / style</td><td>服务端可选配置</td><td>供应商支持时控制质量或风格。</td><td>设置页不提供输入；接口拒绝时移除后重试。</td></tr><tr><td>response.data[]</td><td>URL 或 Base64</td><td>读取 url、image_url、b64_json 或 base64。</td><td>校验确为图片后保存到 generated/&lt;jobId&gt;/。</td></tr><tr><td>job manifest</td><td>每张图完成即写入</td><td>保存 prompt、slot、方案、identityLock 与结果地址。</td><td>服务重启后已完成图片仍可追溯，未完成项提示重提。</td></tr><tr><td>consistencyGate</td><td>完成时为 needs_review</td><td>记录整套图共享身份与约束后的复核状态。</td><td>不是视觉质检通过；正式发布前仍需人工检查。</td></tr></tbody></table></div></details>
+    <p class="callout"><b>优先级一句话：</b>用户明确输入 ＞ 报告与参考图默认值 ＞ 新品方案细节 ＞ 当前图片默认表达；未明确修改的字段继续沿用报告基准，品牌、交易、认证等平台禁区始终有效。</p></section>
+    <div class="channel-grid"><section class="card"><h2 style="margin-top:0">分析渠道</h2><p style="color:#667067">负责提炼商品事实、生成报告与新品方案；不直接输出图片。</p>
+    <label>分析 API Base</label><input id="base" value="{base}"><small class="field-help">OpenAI-compatible 文本模型服务根地址；服务端会拼接 <code>/models</code> 和 <code>/chat/completions</code>。</small><label>分析 API Key（{key_state}）</label><input id="key" type="password" placeholder="粘贴新的 Key；已保存时可留空"><small class="field-help">仅保存在本机配置文件中；留空表示继续使用已保存值，页面不会回显密钥。</small><label>分析模型（必填）</label><input id="model" value="{model}" placeholder="例如 qwen3.7-flash"><small class="field-help">用于七角色商品分析和结构化报告，不会代替下方生图模型。</small></section>
+    <section class="card"><h2 style="margin-top:0">生图渠道</h2><p style="color:#667067">负责主图和详情图，可使用与分析渠道不同的服务商、Key 和模型；API Base 与 Key 未单独配置时，各字段分别复用分析渠道。</p>
+    <label>生图 API Base</label><input id="imageBase" value="{image_base}" placeholder="例如 https://example.com/v1；未配置时复用分析 API Base"><small class="field-help">生图服务根地址；配置值为空时继承“分析 API Base”。当前实际模式：<b>{html.escape(image_channel_label)}</b>。</small><label>生图 API Key（{image_key_state}）</label><input id="imageKey" type="password" placeholder="粘贴生图渠道 Key；已保存时可留空"><small class="field-help">未保存独立 Key 时继承分析 Key；若上方标记“已单独保存”，输入框留空表示继续使用已保存值。页面永不回显密钥。</small><label>生图模型（必填）</label><input id="imageModel" value="{image_model}" placeholder="例如 qwen-image-3.0"><small class="field-help">写入请求体 <code>model</code>；保存时会调用模型列表接口验证是否可用。</small><label>生图接口路径</label><input id="imagePath" value="{image_path}"><small class="field-help">拼接在实际 API Base 后；默认 <code>/images/generations</code>。当前完整端点：<code>{image_endpoint}</code>。</small>
+    <button onclick="save()">保存并测试连接</button><button class="secondary" onclick="test()">仅重新测试</button><div id="msg" role="status" aria-live="polite">{'配置错误：'+cfg_err if cfg_err else ('API错误：'+probe if (is_cfg and not api_ok and probe) else '')}</div></section></div>
+    <section class="card"><h2 style="margin-top:0">提示词与业务联动</h2><p>查看当前模板原文、变量说明和真实模型联动。<code>image_generation</code> 模板必须保留 <code>{{prompt}}</code>，保存后下一次预览与正式生图立即生效。</p><p><a href="/prompts">打开提示词与模型联动配置 →</a></p></section>
     <section class="card"><h2 style="margin-top:0">下一步</h2><p>Chrome 只需加载一次 <code>extension</code> 文件夹。之后每次使用：双击启动 → 打开已登录的天猫商品页 → 可选导入监测数据 → 点击扩展“开始深度采集”。</p></section></div>
     <script>
-    async function save(){{const msg=document.getElementById('msg');msg.textContent='正在保存并测试…';const r=await fetch('/api/config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{api_base:base.value,api_key:key.value,model:model.value}})}});const d=await r.json();msg.textContent=d.ok?'✓ 配置已保存，API连接正常。现在可以去天猫商品页运行扩展。':'✕ '+(d.error||'配置失败');if(d.ok)setTimeout(()=>location.reload(),600)}}
-    async function test(){{const msg=document.getElementById('msg');msg.textContent='正在测试…';const r=await fetch('/api/model-test');const d=await r.json();msg.textContent=d.ok?'✓ API连接正常，模型 '+(d.model||'')+' 可用。':'✕ '+(d.error||'连接失败')}}
+    async function save(){{const msg=document.getElementById('msg');if(!model.value.trim()||!imageModel.value.trim()){{msg.textContent='✕ 分析模型和生图模型都必须填写。';return}}msg.textContent='正在保存并分别测试两个渠道…';const r=await fetch('/api/config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{api_base:base.value,api_key:key.value,model:model.value,image_api_base:imageBase.value,image_api_key:imageKey.value,image_model:imageModel.value,image_path:imagePath.value}})}});const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道和生图渠道均已保存并验证。':'✕ '+(d.error||'配置失败');if(d.ok)setTimeout(()=>location.reload(),700)}}
+    async function test(){{const msg=document.getElementById('msg');msg.textContent='正在分别测试两个渠道…';const r=await fetch('/api/model-test');const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道：'+(d.analysis?.model||'')+'；生图渠道：'+(d.image?.imageModel||'')+(d.image?.separateChannel?'（独立渠道）':'（复用分析渠道）'):'✕ '+(d.error||'连接失败')}}
     </script></body></html>'''
 
 def prompt_page():
@@ -370,9 +1050,11 @@ def prompt_page():
     items={k:{'name':v.name,'body':saved.get(k,{}).get('body',v.body),'variables':list(v.variables)} for k,v in TEMPLATES.items()}
     vars_html=''.join(f'<div class="var"><b>{html.escape(k)}</b><br>{html.escape(v)}</div>' for k,v in PRODUCT_VARIABLES.items())
     template_html=''.join(f'<section class="card"><h2>{html.escape(k)}</h2><p>变量：{html.escape("、".join(v["variables"]) or "自定义")}</p><textarea data-key="{html.escape(k)}">{html.escape(v["body"])}</textarea></section>' for k,v in items.items())
+    c=load_config(); channel=_image_channel_label(c)
+    live_html=f'<section class="card live"><h2>当前真实联动</h2><div class="vars"><div class="var"><b>生图渠道</b><br>{html.escape(channel)}</div><div class="var"><b>生图 API</b><br>{html.escape(c.get("image_api_base") or c.get("api_base") or "未配置")}</div><div class="var"><b>生图模型</b><br>{html.escape(c.get("image_model") or "未配置")}</div><div class="var"><b>接口路径</b><br>{html.escape(c.get("image_path") or "/images/generations")}</div></div><p>生成时先用报告中的真实商品事实、具体开品方案与每张图任务组成 <code>{{prompt}}</code>，再套用下方“image_generation”模板。</p></section>'
     return ('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-      '<title>提示词配置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;background:#f5faf9;margin:0}.wrap{max-width:1100px;margin:30px auto;padding:0 20px}.card{background:#fff;border:1px solid #dbe8e8;border-radius:16px;padding:22px;margin:16px 0}textarea{width:100%;min-height:260px;font:14px monospace;padding:12px;border:1px solid #bcd8d6;border-radius:10px}button{background:#008f7a;color:#fff;border:0;border-radius:9px;padding:12px 18px;font-weight:700;cursor:pointer}.vars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.var{background:#eef9f7;padding:10px;border-radius:8px;font-size:13px}</style>'
-      '<div class="wrap"><h1>提示词可视化配置</h1><p>编辑后保存，下一次分析任务生效。</p><section class="card"><h2>商品变量说明</h2><div class="vars">'+vars_html+'</div></section>'+template_html
+      '<title>提示词配置</title><style>body{font-family:-apple-system,BlinkMacSystemFont,PingFang SC,sans-serif;background:#f5faf9;margin:0;color:#122027}.wrap{max-width:1100px;margin:30px auto;padding:0 20px}.card{background:#fff;border:1px solid #dbe8e8;border-radius:16px;padding:22px;margin:16px 0}.live{border-top:4px solid #008f7a}textarea{width:100%;min-height:260px;font:14px monospace;padding:12px;border:1px solid #bcd8d6;border-radius:10px}button{background:#008f7a;color:#fff;border:0;border-radius:9px;padding:12px 18px;font-weight:700;cursor:pointer}.vars{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}.var{background:#eef9f7;padding:10px;border-radius:8px;font-size:13px}code{background:#eaf7f5;padding:2px 5px}</style>'
+      '<div class="wrap"><h1>提示词与模型联动配置</h1><p>编辑后保存，下一次分析或生图任务立即生效。</p>'+live_html+'<section class="card"><h2>商品变量说明</h2><div class="vars">'+vars_html+'</div></section>'+template_html
       +'<button onclick="save()">保存全部模板</button><span id="msg" style="margin-left:12px"></span></div><script>async function save(){const templates={};document.querySelectorAll("textarea[data-key]").forEach(x=>templates[x.dataset.key]={body:x.value});const r=await fetch("/api/prompts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({templates})});const d=await r.json();document.getElementById("msg").textContent=d.ok?"已保存":"保存失败："+(d.error||"")}</script></html>')
 
 class H(BaseHTTPRequestHandler):
@@ -393,6 +1075,9 @@ class H(BaseHTTPRequestHandler):
                 n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
                 templates=data.get('templates') if isinstance(data.get('templates'),dict) else {}
                 clean={k:{'body':str(v.get('body',''))[:100000]} for k,v in templates.items() if k in TEMPLATES and isinstance(v,dict)}
+                image_body=(clean.get('image_generation') or {}).get('body','')
+                if image_body and '{prompt}' not in image_body:
+                    self.send_json({'ok':False,'error':'image_generation 模板必须保留 {prompt}，它负责注入真实商品与具体开品方案'},400); return
                 PROMPT_CONFIG.write_text(json.dumps(clean,ensure_ascii=False,indent=2),'utf-8'); self.send_json({'ok':True})
             except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
             return
@@ -446,8 +1131,65 @@ class H(BaseHTTPRequestHandler):
                 save_config(data)
                 MODEL_PROBE=probe_model_api(timeout=18); MODEL_PROBE_AT=time.time()
                 if not MODEL_PROBE.get('ok'): self.send_json({'ok':False,'error':MODEL_PROBE.get('error') or 'API连接失败','probe':MODEL_PROBE},400); return
-                self.send_json({'ok':True,'model':load_config().get('model'),'probe':MODEL_PROBE}); return
+                c=load_config()
+                if not c.get('image_model'): self.send_json({'ok':False,'error':'生图模型为必填项'},400); return
+                image_probe=probe_image_api(timeout=18)
+                if not image_probe.get('ok'): self.send_json({'ok':False,'error':'生图渠道连接失败：'+str(image_probe.get('error') or ''),'analysis':MODEL_PROBE,'image':image_probe},400); return
+                if image_probe.get('imageModelFound') is False: self.send_json({'ok':False,'error':'生图渠道的模型列表中未找到 '+str(c.get('image_model')),'analysis':MODEL_PROBE,'image':image_probe},400); return
+                self.send_json({'ok':True,'model':c.get('model'),'imageModel':c.get('image_model'),'analysis':MODEL_PROBE,'image':image_probe}); return
             except Exception as e: self.send_json({'ok':False,'error':str(e)},400); return
+        if self.path=='/api/generate-images':
+            try:
+                n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
+                report=_load_report_for_generation(data)
+                exp=report.get('experienceSolution') or {}; plans=(exp.get('newProductPlans') or {}).get('plans') or report.get('launchPlans',{}).get('plans') or []
+                if not plans: raise ValueError('报告没有可执行的新品推荐方案')
+                idx=int(data.get('planIndex',0));
+                if idx<0 or idx>=len(plans): raise ValueError('方案索引无效')
+                job_id='img_'+time.strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:8]
+                chosen=plans[idx]; product=(report.get('facts') or {}).get('product') or {}
+                IMAGE_JOBS[job_id]={'jobId':job_id,'status':'queued','progress':5,'results':[],'createdAt':time.time(),
+                                    'planName':chosen.get('name') or '未命名开品方案',
+                                    'productName':product.get('title') or '商品','reportSource':str(data.get('source') or '')}
+                threading.Thread(target=_generation_worker,args=(job_id,report,data),daemon=True).start()
+                self.send_json({'ok':True,'jobId':job_id,'statusUrl':f'/api/image-job/{job_id}'})
+            except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
+            return
+        if self.path=='/api/image-prompt-preview':
+            try:
+                n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
+                report=_load_report_for_generation(data)
+                exp=report.get('experienceSolution') or {}; plans=(exp.get('newProductPlans') or {}).get('plans') or report.get('launchPlans',{}).get('plans') or []
+                idx=int(data.get('planIndex',0))
+                if not plans or idx<0 or idx>=len(plans): raise ValueError('方案索引无效')
+                types=data.get('assetTypes') or ['main','detail']; types=[x for x in types if x in ('main','detail')]
+                chosen=plans[idx]; slots=build_generation_slots(report,chosen)
+                refs,ref_source=resolve_reference_images(report,chosen,data.get('referenceImages'))
+                fission_pattern=bool(data.get('fissionPattern', ref_source!='uploaded')) and ref_source!='uploaded'
+                prompt_overrides=data.get('promptOverrides') if isinstance(data.get('promptOverrides'),dict) else {}
+                blocked_terms=_report_visual_identity_terms(report)
+                user_direction=_image_user_direction(data.get('userDirection'),blocked_terms)
+                user_direction=_apply_product_overrides(
+                    user_direction,
+                    _collect_prompt_product_overrides(prompt_overrides,blocked_terms),
+                )
+                identity_lock=build_identity_lock(report,chosen,user_direction)
+                selected=[slot for slot in slots if slot['assetType'] in (types or ['main','detail'])]
+                prompts={}; prompt_merges={}; user_direction_by_slot={}
+                for slot in selected:
+                    asset_type=slot['assetType']
+                    slot_direction=_user_direction_for_slot(user_direction,slot)
+                    prompt_key=f"{asset_type}:{slot.get('index')}"
+                    user_direction_by_slot[prompt_key]=slot_direction
+                    reference_mode=image_reference_mode(ref_source,fission_pattern,slot)
+                    base_prompt=build_image_prompt(report,chosen,asset_type,slot['index']-1,slot,slot_direction,reference_mode,identity_lock)
+                    prompt,prompt_merge=merge_image_prompt_with_user_edit(base_prompt,prompt_overrides.get(prompt_key),slot,slot_direction)
+                    prompts.setdefault(asset_type,[]).append(prompt)
+                    prompt_merges[prompt_key]=prompt_merge
+                self.send_json({'ok':True,'slots':selected,'prompts':prompts,'promptMerges':prompt_merges,'userDirectionBySlot':user_direction_by_slot,
+                                'referenceSource':ref_source,'referenceCount':len(refs),'fissionPattern':fission_pattern,'userDirection':user_direction})
+            except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
+            return
         if self.path not in ('/api/analyze','/api/analyze-current'): self.send_error(404);return
         try:
             c=load_config(); model_ready=configured()
@@ -486,7 +1228,7 @@ class H(BaseHTTPRequestHandler):
         global MODEL_PROBE, MODEL_PROBE_AT
         p=urlparse(self.path).path
         if p=='/health':
-            c=load_config(); self.send_json({'ok':True,'serverVersion':SERVER_VERSION,'modelConfigured':configured(),'model':c.get('model') or None,'apiBase':c.get('api_base') or None,'configPath':c.get('_config_path'),'configError':c.get('_config_error') or None,'modelProbe':MODEL_PROBE,'port':PORT}); return
+            c=load_config(); self.send_json({'ok':True,'serverVersion':SERVER_VERSION,'modelConfigured':configured(),'model':c.get('model') or None,'imageModelConfigured':bool(c.get('image_model')),'imageModel':c.get('image_model') or None,'apiBase':c.get('api_base') or None,'configPath':c.get('_config_path'),'configError':c.get('_config_error') or None,'modelProbe':MODEL_PROBE,'port':PORT}); return
         if p=='/api/prompts':
             saved={}
             if PROMPT_CONFIG.exists():
@@ -500,7 +1242,9 @@ class H(BaseHTTPRequestHandler):
         if p=='/version':
             self.send_json({'ok':True,'serverVersion':SERVER_VERSION,'port':PORT}); return
         if p=='/api/model-test':
-            MODEL_PROBE=probe_model_api(timeout=18); MODEL_PROBE_AT=time.time(); self.send_json(MODEL_PROBE,200 if MODEL_PROBE.get('ok') else 502); return
+            MODEL_PROBE=probe_model_api(timeout=18); MODEL_PROBE_AT=time.time(); image_probe=probe_image_api(timeout=18)
+            ok=bool(MODEL_PROBE.get('ok') and image_probe.get('ok') and image_probe.get('imageModelFound') is not False)
+            self.send_json({'ok':ok,'analysis':MODEL_PROBE,'image':image_probe,'error':(MODEL_PROBE.get('error') or image_probe.get('error')) if not ok else None},200 if ok else 502); return
         if p.startswith('/api/monitor/'):
             item_id=p.rsplit('/',1)[-1]; mp=monitor_path(item_id).with_suffix('.json')
             if not mp.exists(): self.send_json({'ok':True,'days':0}); return
@@ -509,6 +1253,31 @@ class H(BaseHTTPRequestHandler):
             except Exception as e: self.send_json({'ok':False,'error':str(e)},500); return
         if p.startswith('/api/task/'):
             tid=p.rsplit('/',1)[-1]; t=TASKS.get(tid); self.send_json(t if t else {'error':'task not found'},200 if t else 404); return
+        if p.startswith('/api/image-job/'):
+            jid=p.rsplit('/',1)[-1]; job=IMAGE_JOBS.get(jid)
+            if not job:
+                saved=REPORTS/f'generated_{jid}.json'
+                if saved.exists():
+                    try: job=json.loads(saved.read_text('utf-8'))
+                    except Exception: job=None
+                    if isinstance(job,dict) and job.get('status') in ('queued','generating','running'):
+                        job['status']='error'; job['progress']=100
+                        job['error']='本地服务在生图过程中重启；已成功保存的图片仍可在下方查看，请重新提交未完成的图片任务。'
+                        job['completedAt']=time.time()
+                        try: _persist_image_job(jid,job)
+                        except Exception: pass
+            self.send_json(job if job else {'error':'image job not found'},200 if job else 404); return
+        if p=='/api/image-jobs':
+            source=(parse_qs(urlparse(self.path).query).get('source') or [''])[0]
+            jobs={k:dict(v) for k,v in IMAGE_JOBS.items()}
+            for saved in REPORTS.glob('generated_img_*.json'):
+                try:
+                    item=json.loads(saved.read_text('utf-8'))
+                    if isinstance(item,dict) and item.get('jobId'): jobs[item['jobId']]=item
+                except Exception: pass
+            records=[x for x in jobs.values() if not source or x.get('reportSource')==source]
+            records.sort(key=lambda x:float(x.get('createdAt') or 0),reverse=True)
+            self.send_json({'ok':True,'records':records[:50]}); return
         if p.startswith('/task/'):
             tid=p.rsplit('/',1)[-1]; b=task_page(tid).encode();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b);return
         if p=='/task.js':

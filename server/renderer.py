@@ -348,8 +348,16 @@ def visual_status_html(images, verified_visual):
 def competition_html(plans, product_exp, overview):
     point=''
     for plan in arr(plans.get('plans'))[:1]:
-        if isinstance(plan,dict) and arr(plan.get('sellingPoints')):
-            point=concise(plan['sellingPoints'][0].get('slogan'),42,False)
+        if not isinstance(plan, dict):
+            continue
+        selling_points = arr(plan.get('sellingPoints'))
+        first_point = selling_points[0] if selling_points else None
+        if isinstance(first_point, dict):
+            point = concise(first_point.get('slogan'), 42, False)
+        elif isinstance(first_point, list) and first_point:
+            nested_first = first_point[0]
+            if isinstance(nested_first, dict):
+                point = concise(nested_first.get('slogan'), 42, False)
     risks=[concise(x.get('label'),34,False) for x in arr(product_exp.get('gates'))[:3] if isinstance(x,dict)]
     return '<div class="competition-grid"><article class="strong"><span>核心价值</span><strong>'+H(point or '已确认体验可复用')+'</strong><p>来自页面参数与评论聚合，不写市场推断。</p></article><article class="mid"><span>基础能力</span><strong>类目关键参数、规格与页面需要和真实商品一致</strong><p>基础能力必须被主图、详情和参数共同证明。</p></article><article class="weak"><span>风险点</span><strong>'+H(' / '.join(x for x in risks if x) or '按评论明确问题处理')+'</strong><p>风险只按真实评论和参数校验项呈现。</p></article></div>'
 

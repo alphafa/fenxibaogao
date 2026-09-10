@@ -17,6 +17,7 @@ PRODUCT_VARIABLES = {
     "evidence": "统一证据账本；模型只能引用其中的 evidenceId",
     "roleOutputs": "七角色中间结论：商品策略、电商转化、消费者洞察、产品/供应链、视觉设计、老板决策与总编审核；只能交叉校验和编排，不得当作无证据事实",
     "renderingPolicy": "最终可见性规则：只展示真实非空内容；证据以来源类型和内容摘要呈现，evidenceId仅用于追溯",
+    "prompt": "系统根据真实商品事实、具体开品方案、套图槽位和平台约束生成的完整生图提示词",
 }
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class PromptTemplate:
 TEMPLATES = {
     "system": PromptTemplate("system", "{system}\n\n可用商品变量说明：\n{variable_schema}", ("system", "variable_schema")),
     "task": PromptTemplate("task", "{task}\n\n输入变量：{input_variables}", ("task", "input_variables")),
+    "image_generation": PromptTemplate("image_generation", "{prompt}", ("prompt",)),
 }
 
 def register_template(name, body, variables=()):
@@ -61,3 +63,17 @@ def build_system_prompt(system_text):
 def build_task_prompt(task_text, variables=("evidence",)):
     names = "、".join(f"{name}（{PRODUCT_VARIABLES.get(name, '任务上下文变量')}）" for name in variables)
     return TEMPLATES["task"].render(task=task_text, input_variables=names)
+
+def build_image_generation_prompt(prompt_text):
+    """Apply the operator-configured image prompt wrapper to the real generation prompt."""
+    body=TEMPLATES["image_generation"].body
+    override=Path(__file__).with_name('prompts.json')
+    if override.exists():
+        try:
+            data=json.loads(override.read_text('utf-8'))
+            configured_body=(data.get('image_generation') or {}).get('body') if isinstance(data,dict) else None
+            if configured_body: body=str(configured_body)
+        except Exception: pass
+    if '{prompt}' not in body:
+        raise ValueError('生图提示词模板必须包含 {prompt}，否则无法与真实商品方案联动')
+    return body.replace('{prompt}', str(prompt_text or ''))

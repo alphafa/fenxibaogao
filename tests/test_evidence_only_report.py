@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'server'))
@@ -47,13 +48,13 @@ class EvidenceOnlyReportTest(unittest.TestCase):
             'meta': {},
         }
 
-    def test_empty_model_result_still_generates_reviewable_report(self):
+    def test_empty_model_result_repairs_core_modules_before_report(self):
         result = ensure_experience_solution(self.analysis)
         self.assertFalse(result['meta']['fallbackReport'])
         self.assertTrue(result['meta']['reportReady'])
-        self.assertFalse(result['meta']['reportAuditPassed'])
-        self.assertEqual('needs_review', result['meta']['reportQuality'])
-        self.assertIn('审核未通过', result['meta']['reportNotice'])
+        self.assertTrue(result['meta']['reportAuditPassed'])
+        self.assertEqual('passed', result['meta']['reportQuality'])
+        self.assertEqual([], result['meta']['reportValidation']['missing'])
         self.assertEqual('', result['facts']['product']['title'])
         self.assertEqual(['面料支数', '床单面料材质', '适用床尺寸'], [x['name'] for x in result['facts']['attributes']])
         self.assertEqual(2, result['baseline']['reviewCount'])
@@ -62,9 +63,20 @@ class EvidenceOnlyReportTest(unittest.TestCase):
         self.assertTrue(cards)
         self.assertEqual('下一款明确卖点', cards[0]['label'])
         self.assertIn('ATTR_0003', cards[0]['evidenceIds'])
-        self.assertEqual([], result['experienceSolution']['productExperience']['gates'])
+        self.assertGreaterEqual(len(result['experienceSolution']['productExperience']['parameterFacts']), 2)
+        self.assertGreaterEqual(len(result['experienceSolution']['productExperience']['gates']), 2)
+        self.assertGreaterEqual(len(result['experienceSolution']['validationLoop']['rows']), 3)
         html = render(result, 'fixture')
-        self.assertIn('审核未通过', html)
+        self.assertNotIn('审核未通过', html)
+
+    def test_unrepairable_core_audit_blocks_report(self):
+        with patch('analysis.repair_core_solution_with_evidence', side_effect=lambda draft, raw, base=None: draft):
+            result = ensure_experience_solution(self.analysis)
+        self.assertFalse(result['meta']['reportReady'])
+        self.assertFalse(result['meta']['reportAuditPassed'])
+        self.assertEqual('blocked', result['meta']['reportQuality'])
+        self.assertIn('已停止生成', result['meta']['reportBlockedReason'])
+        self.assertNotIn('reportNotice', result['meta'])
 
     def test_analysis_runs_without_model_channel_uses_evidence_fallback(self):
         raw = dict(self.analysis['facts'])
@@ -194,7 +206,10 @@ class EvidenceOnlyReportTest(unittest.TestCase):
         self.assertIn('材质 / 成分', labels)
         self.assertEqual([], signals['risks'])
         self.assertTrue(signals['questions'][0]['label'].startswith('购买前关注：'))
-        self.assertEqual(2, len(result['experienceSolution']['newProductPlans']['plans']))
+        plans = result['experienceSolution']['newProductPlans']['plans']
+        self.assertEqual(3, len(plans))
+        self.assertEqual(['证据驱动优化', '反馈驱动升级', '探索性方向'], [x['sourceType'] for x in plans])
+        self.assertTrue(all(x['name'].endswith('款') for x in plans))
         self.assertNotIn('无证据升级', output)
         self.assertNotIn('项目负责人', output)
         self.assertNotIn('客户为什么购买', output)

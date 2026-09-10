@@ -79,12 +79,12 @@ FINAL_REPORT_PROMPT='''任务G｜V9.3.0 七角色总编报告编排器。你只�
     {"label":"下一款优先","headline":"<=18字","note":"<=22字","evidenceIds":[]}
   ]},
   "titleAnalysis":{"professionalOpinion":"<=45字","originalTitle":"","currentExpression":[{"value":"<=10字","evidenceIds":[]}],"reinforce":[{"topic":"<=10字","evidenceIds":[]}],"recommendedActions":[{"action":"<=22字","evidenceIds":[]}],"recommendedTitles":[]},
-  "visualCommerce":{"professionalOpinion":"<=45字","items":[{"imageEvidenceId":"IMG_MAIN_0001","imageRole":"<=8字","visualSignals":["<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","evidenceIds":[]}],"evidenceDetail":[]},
-  "detailCommerce":{"professionalOpinion":"<=45字","contentGroups":[{"type":"品牌服务|套件组成|材质品质|产品功能|使用便利|花型选择|用户验证|其他","representativeImageId":"IMG_DETAIL_0001","visualSignals":["<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","imageEvidenceIds":[],"evidenceIds":[]}],"pageSequence":[]},
+  "visualCommerce":{"professionalOpinion":"<=45字","items":[{"imageEvidenceId":"IMG_MAIN_0001","imageRole":"<=8字","visualSignals":["<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"product_overview|usage_scene|material_touch|structure_function|spec_choice","evidenceIds":[]}],"evidenceDetail":[]},
+  "detailCommerce":{"professionalOpinion":"<=45字","contentGroups":[{"type":"场景证明|材质证明|结构工艺|功能表现|规格适配|使用维护","representativeImageId":"IMG_DETAIL_0001","visualSignals":["<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"scene_problem|material_proof|structure_proof|function_proof|spec_adaptation|care_durability","imageEvidenceIds":[],"evidenceIds":[]}],"pageSequence":[]},
   "skuAnalysis":{"professionalOpinion":"<=35字","selectionDimensions":[{"name":"<=8字","values":[],"evidenceIds":[]}],"recommendedOrder":[],"representativeImageIds":[],"recommendedAction":"<=24字","structuredStatus":"confirmed|missing","structuredCount":null,"imageCount":0},
   "customerExperience":{"professionalOpinion":"<=45字","consumerInsights":{"experienceSignals":[{"type":"稳定体验|体验差异|购前关注|对新品的启示","insight":"<=28字","evidenceIds":[]}],"productImplications":[]},"buyerEvidence":{}},
   "expressionContinuity":{"coreClaims":[{"claim":"<=24字","mainStatus":"expressed|partial|missing","detailStatus":"proven|partial|missing","reviewStatus":"validated|partial|missing","nextAction":"<=24字","evidenceIds":[]}]},
-  "newProductPlans":{"professionalOpinion":"<=45字","plans":[{"sourceType":"证据驱动优化|反馈驱动升级|探索性方向","type":"现有基础优化|强化体验区分|强化设计选择|其他","name":"<=18字","whyThisPlan":"<=32字","visualReferenceImageIds":[],"productAction":"<=28字","pageAction":"<=28字","validation":"<=20字","evidenceIds":[]}]},
+  "newProductPlans":{"professionalOpinion":"<=45字","plans":[{"sourceType":"证据驱动优化|反馈驱动升级|探索性方向","name":"<=18字","productAction":"<=45字","pageAction":"<=36字"}]},
   "productExperience":{"parameterFacts":[],"gates":[]},
   "validationLoop":{"rows":[]}
 }
@@ -92,8 +92,10 @@ FINAL_REPORT_PROMPT='''任务G｜V9.3.0 七角色总编报告编排器。你只�
 硬规则：
 - ownerOverview.cards 必须正好3项，且分别回答“为什么能卖 / 值得继承 / 下一款优先”。
 - visualCommerce.items 中每张图必须优先给 visualSignals；不要写长 message。
-- detailCommerce.contentGroups 证据允许时输出4-6组。
-- newProductPlans.plans>=1；第三类创新若不是直接证据结论必须标 sourceType=探索性方向。
+- detailCommerce.contentGroups 证据允许时输出4-6组，顺序必须是场景 → 材质 → 结构/工艺 → 功能 → 规格 → 使用维护。
+- 主图与详情必须形成连续页面：主图先让用户看懂商品和使用入口，详情逐项证明；同一卖点只能在一个信息任务中承担主责。
+- 主图和详情只表达商品本身的结构、材质、成分、尺寸、件数、功能、工艺、触感、使用场景和洗护等内容。品牌、商标、专利、授权、认证、奖项、包邮、物流、价格、销量、促销、客服、售后、二维码、防伪和店铺信息不得进入 visualCommerce 或 detailCommerce。
+- newProductPlans.plans 必须正好3项，依次为证据驱动优化、反馈驱动升级、探索性方向；探索项必须明确为待验证方向，不能当作已验证结论。
 - productExperience.parameterFacts>=2、productExperience.gates>=2、validationLoop.rows>=3，继续用于工程证据校验，但默认报告不展示。
 - 禁止用户可见字段出现[数据事实][分析判断][设计建议][证据不足]。
 - 只返回有真实内容的可选字段；不得用空字符串、空数组、空对象或“暂无/未采集/待补充”填充版面。
@@ -102,7 +104,7 @@ FINAL_REPORT_PROMPT='''任务G｜V9.3.0 七角色总编报告编排器。你只�
 
 FINAL_REPORT_REPAIR_PROMPT='''任务G-R｜修复 V9.3.0 最终报告 JSON。只修复结构缺失和证据引用，不扩写正文。
 必须保留短文本与图片信息优先规则。
-强制最小结构：reportSummary.title/verdict非空；ownerOverview.cards>=3；productExperience.parameterFacts>=2；productExperience.gates>=2；newProductPlans.plans>=1；validationLoop.rows>=3。
+强制最小结构：reportSummary.title/verdict非空；ownerOverview.cards>=3；productExperience.parameterFacts>=2；productExperience.gates>=2；newProductPlans.plans=3；validationLoop.rows>=3。
 如果 customerExperience 有评论证据，优先保留 experienceSignals；无评论时允许为空。
 所有 evidenceIds 只能来自 ACTUAL_EVIDENCE。不要输出 Markdown、解释或包装层。
 可选字段没有真实内容时直接省略，不得填入“暂无、未采集、待补充”或空容器。
@@ -680,6 +682,69 @@ def _apply_selling_points(exp, raw, base=None):
     }
     return exp
 
+def _ensure_three_product_plans(exp, raw, base=None):
+    """Keep one evidence-backed plan for each decision horizon, even when the model returns fewer."""
+    if not isinstance(exp,dict):return exp
+    base=base or baseline(raw); block=exp.setdefault('newProductPlans',{})
+    existing=[x for x in block.get('plans',[]) or [] if isinstance(x,dict)]
+    valid_types=('证据驱动优化','反馈驱动升级','探索性方向')
+    by_type={}
+    untyped=[]
+    for plan in existing:
+        source=_txt(plan.get('sourceType')).strip()
+        if source in valid_types and source not in by_type:by_type[source]=dict(plan)
+        else:untyped.append(dict(plan))
+    for source in valid_types:
+        if source not in by_type and untyped:
+            plan=untyped.pop(0);plan['sourceType']=source;by_type[source]=plan
+
+    attrs=_attribute_rows(raw);issue=_review_issue(raw);points=_derive_next_selling_points(raw,base,issue)
+    attr_refs=[f'ATTR_{i:04d}' for i in range(1,min(len(attrs),6)+1)]
+    review_refs=[]
+    if issue and issue.get('evidenceId'):review_refs.append(issue['evidenceId'])
+    for point in points:
+        review_refs.extend(x for x in point.get('evidenceIds',[]) or [] if _txt(x).startswith('REV_'))
+    review_refs=_uniq(review_refs)[:6]
+    shared_refs=_uniq((attr_refs or ['P_TITLE'])+review_refs)
+    strongest=points[0] if points else {}
+
+    fallbacks={
+      '证据驱动优化':{
+        'sourceType':'证据驱动优化','name':'规格校准款',
+        'productAction':_txt(strongest.get('productAction')).strip() or '统一现有规格、材质、结构与套件口径',
+        'pageAction':'主图讲清商品与场景，详情逐项证明材质、结构和规格',
+        'evidenceIds':shared_refs,
+      },
+      '反馈驱动升级':{
+        'sourceType':'反馈驱动升级','name':'体验升级款',
+        'productAction':(_txt(issue.get('action')).strip() if issue else '') or '围绕已采消费者反馈优化使用体验与规格适配',
+        'pageAction':'用实拍动作、细节近景和对照信息回应购买顾虑',
+        'evidenceIds':_uniq(review_refs+attr_refs) or shared_refs,
+      },
+      '探索性方向':{
+        'sourceType':'探索性方向','name':'差异探索款',
+        'productAction':'基于现有结构开发差异化配色或规格小样，先验证再定款',
+        'pageAction':'独立展示探索设计与适用场景，不宣称已获市场验证',
+        'evidenceIds':shared_refs,
+      },
+    }
+    plans=[]
+    for source in valid_types:
+        plan=by_type.get(source) or fallbacks[source]
+        plan['sourceType']=source
+        if not _txt(plan.get('name')).strip():plan['name']=fallbacks[source]['name']
+        name=_txt(plan.get('name')).strip()
+        if len(name)>14:name=fallbacks[source]['name']
+        if not name.endswith('款'):name=name[:17].rstrip(' ，。-')+'款'
+        plan['name']=name[:17].rstrip(' ，。-')+'款' if len(name)>18 else name
+        if not _txt(plan.get('productAction')).strip():plan['productAction']=fallbacks[source]['productAction']
+        if not _txt(plan.get('pageAction')).strip():plan['pageAction']=fallbacks[source]['pageAction']
+        if not plan.get('evidenceIds'):plan['evidenceIds']=fallbacks[source]['evidenceIds']
+        plans.append(plan)
+    block['plans']=plans
+    block['professionalOpinion']=block.get('professionalOpinion') or '三条路径并行对照：先优化现有商品，再回应反馈，最后小样验证差异方向。'
+    return exp
+
 def _generic_platform_overview(raw, base=None):
     base=base or baseline(raw); route=detect_category(raw); attrs=_attribute_rows(raw); sales=raw.get('sales') or {}; issue=_review_issue(raw)
     price=_txt(sales.get('currentPrice')).strip(); sold=_txt(sales.get('sold') or sales.get('cumulativeSales')).strip(); facts=[]
@@ -746,7 +811,7 @@ def _core_solution_ok(exp):
       isinstance((exp.get('ownerOverview') or {}).get('cards'),list) and len((exp.get('ownerOverview') or {}).get('cards'))>=3,
       isinstance((exp.get('productExperience') or {}).get('parameterFacts'),list) and len((exp.get('productExperience') or {}).get('parameterFacts'))>=2,
       isinstance((exp.get('productExperience') or {}).get('gates'),list) and len((exp.get('productExperience') or {}).get('gates'))>=2,
-      isinstance((exp.get('newProductPlans') or {}).get('plans'),list) and len((exp.get('newProductPlans') or {}).get('plans'))>=1,
+      isinstance((exp.get('newProductPlans') or {}).get('plans'),list) and len((exp.get('newProductPlans') or {}).get('plans'))>=3,
       isinstance((exp.get('validationLoop') or {}).get('rows'),list) and len((exp.get('validationLoop') or {}).get('rows'))>=3,
     )
     return all(checks)
@@ -759,7 +824,7 @@ def core_solution_diagnostics(exp):
       ('ownerOverview.cards',isinstance((exp.get('ownerOverview') or {}).get('cards'),list),len((exp.get('ownerOverview') or {}).get('cards') or []),3),
       ('productExperience.parameterFacts',isinstance((exp.get('productExperience') or {}).get('parameterFacts'),list),len((exp.get('productExperience') or {}).get('parameterFacts') or []),2),
       ('productExperience.gates',isinstance((exp.get('productExperience') or {}).get('gates'),list),len((exp.get('productExperience') or {}).get('gates') or []),2),
-      ('newProductPlans.plans',isinstance((exp.get('newProductPlans') or {}).get('plans'),list),len((exp.get('newProductPlans') or {}).get('plans') or []),1),
+      ('newProductPlans.plans',isinstance((exp.get('newProductPlans') or {}).get('plans'),list),len((exp.get('newProductPlans') or {}).get('plans') or []),3),
       ('validationLoop.rows',isinstance((exp.get('validationLoop') or {}).get('rows'),list),len((exp.get('validationLoop') or {}).get('rows') or []),3),
     )
     checks=[]
@@ -777,7 +842,7 @@ def repair_core_solution_with_evidence(draft, raw, base=None):
     list_rules=(
       ('ownerOverview','cards',3),
       ('productExperience','parameterFacts',2),('productExperience','gates',2),
-      ('newProductPlans','plans',1),('validationLoop','rows',3),
+      ('newProductPlans','plans',3),('validationLoop','rows',3),
     )
     for section,key in scalar_rules:
         current=dict(draft.get(section) or {})
@@ -980,10 +1045,194 @@ def _filter_evidence_items(values, valid_ids, image=False):
         clean=dict(item);clean['evidenceIds']=refs;out.append(clean)
     return out
 
+VISUAL_EXCLUDED_TERMS=(
+    '品牌','商标','专利','授权','认证','证书','奖项','背书',
+    '包邮','物流','快递','运费','价格','销量','优惠','折扣','促销','红包',
+    '二维码','防伪','官方','店铺','客服','售后','信任服务','品牌服务',
+    '条形码','商品编码','货号','发明人','正宗','产品等级','执行标准','安全类别'
+)
+
+MAIN_VISUAL_TASKS=(
+    {'contentKey':'product_overview','role':'商品全貌','signals':('主体完整','整体组成'),'keywords':('件数','套件','组合','商品','产品'),'nextAction':'先让用户看清商品主体与整体组成'},
+    {'contentKey':'usage_scene','role':'使用场景','signals':('真实使用状态','空间适配'),'keywords':('场景','适用','人群','床型','季节','用途'),'nextAction':'承接使用场景，说明产品适合怎么用'},
+    {'contentKey':'material_touch','role':'材质触感','signals':('材质近景','触感细节'),'keywords':('材质','面料','成分','支数','密度','克重','填充'),'nextAction':'用近景和参数把材质触感讲具体'},
+    {'contentKey':'structure_function','role':'结构功能','signals':('结构细节','使用动作'),'keywords':('结构','工艺','功能','做工','细节','拉链','接口'),'nextAction':'把结构、工艺或功能的实现方式拍清楚'},
+    {'contentKey':'spec_choice','role':'规格选择','signals':('尺寸清楚','选择路径'),'keywords':('尺寸','规格','件数','颜色','款式','SKU','适配'),'nextAction':'最后承接尺寸、件数和选择方式'},
+)
+
+DETAIL_VISUAL_TASKS=(
+    {'contentKey':'scene_problem','role':'场景证明','signals':('使用问题','真实场景'),'keywords':('场景','适用','人群','用途','问题'),'nextAction':'先用真实场景回答产品解决什么使用问题'},
+    {'contentKey':'material_proof','role':'材质证明','signals':('材质参数','表面细节'),'keywords':('材质','面料','成分','支数','密度','克重','填充'),'nextAction':'接着证明材质、成分或填充信息'},
+    {'contentKey':'structure_proof','role':'结构工艺','signals':('结构拆解','工艺细节'),'keywords':('结构','工艺','做工','细节','缝制','接口','拉链'),'nextAction':'继续证明结构、工艺和关键细节'},
+    {'contentKey':'function_proof','role':'功能表现','signals':('使用动作','效果边界'),'keywords':('功能','性能','使用','透气','防护','收纳','连接'),'nextAction':'用使用动作说明功能表现，不扩大功效'},
+    {'contentKey':'spec_adaptation','role':'规格适配','signals':('尺寸对照','套件清单'),'keywords':('规格','尺寸','件数','套件','SKU','适配','颜色','款式'),'nextAction':'单独列清尺寸、件数、款式与适配关系'},
+    {'contentKey':'care_durability','role':'使用维护','signals':('洗护方式','耐用检查'),'keywords':('洗护','洗涤','护理','耐用','首洗','清洁','保存'),'nextAction':'最后说明洗护、耐用或长期使用注意事项'},
+    {'contentKey':'material_closeup','role':'材质近观','signals':('纤维纹理','触感近景'),'keywords':('材质','面料','成分','纤维','触感'),'nextAction':'补充面料纹理与触感的微观证明'},
+    {'contentKey':'craft_closeup','role':'工艺近观','signals':('走线细节','工艺局部'),'keywords':('工艺','缝制','绗缝','做工','细节'),'nextAction':'补充走线、接口或工艺局部的清晰证明'},
+    {'contentKey':'function_scenario','role':'功能场景','signals':('功能动作','使用结果'),'keywords':('功能','使用','性能','保暖','透气','抗菌'),'nextAction':'在真实使用动作中补充功能表现'},
+    {'contentKey':'size_compare','role':'尺寸对照','signals':('尺寸标注','实物对照'),'keywords':('尺寸','规格','床型','长度','宽度'),'nextAction':'用实物与标注对照减少规格误解'},
+    {'contentKey':'set_inventory','role':'套件清单','signals':('部件清楚','组合关系'),'keywords':('件数','套件','组合','配件','被套'),'nextAction':'单独说清套件包含什么及组合关系'},
+    {'contentKey':'color_selection','role':'款式选择','signals':('颜色对比','款式区分'),'keywords':('颜色','配色','花型','款式','SKU'),'nextAction':'用同一版式清楚区分可选颜色或款式'},
+    {'contentKey':'care_steps','role':'洗护步骤','signals':('洗护提示','操作步骤'),'keywords':('洗护','洗涤','护理','晾晒','保存'),'nextAction':'把洗护步骤和注意事项拆成可执行说明'},
+    {'contentKey':'quality_check','role':'耐用核验','signals':('长期使用','品质检查'),'keywords':('耐用','首洗','回弹','起球','褪色'),'nextAction':'补充长期使用和样品核验的观察点'},
+    {'contentKey':'purchase_summary','role':'选择总结','signals':('适用边界','购买确认'),'keywords':('适用','人群','场景','规格','选择'),'nextAction':'最后汇总适用人群、场景和选择边界'},
+)
+
+def _visual_product_text(value, limit=18, blocked_terms=()):
+    """Keep only product-facing phrases; trust and transaction metadata stay outside the visual chain."""
+    if isinstance(value,list):
+        parts=[]
+        for item in value:
+            parts.extend(_visual_product_text(item,limit,blocked_terms))
+        return _uniq(parts)
+    if isinstance(value,dict):
+        for key in ('visualSignals','signal','statement','headline','value','label','topic','action','consumerValue','businessMeaning'):
+            if value.get(key):
+                return _visual_product_text(value.get(key),limit,blocked_terms)
+        return []
+    text=re.sub(r'\s+',' ',_txt(value)).strip(' ，,。；;')
+    if not text:return []
+    pieces=re.split(r'[；;。！？!?，,、|/]+',text)
+    out=[]
+    for piece in pieces:
+        piece=re.sub(r'\s+',' ',piece).strip(' ：:')
+        if not piece or any(term in piece for term in VISUAL_EXCLUDED_TERMS) or any(term and term in piece for term in blocked_terms):continue
+        if piece not in out:out.append(piece[:limit])
+    return out
+
+def _visual_refs(item, valid_ids):
+    refs=[]
+    if isinstance(item,dict):
+        refs.extend(x for x in item.get('evidenceIds',[]) or [] if x in valid_ids)
+        for key in ('imageEvidenceId','representativeImageId'):
+            if item.get(key) in valid_ids:refs.append(item.get(key))
+        refs.extend(x for x in item.get('imageEvidenceIds',[]) or [] if x in valid_ids)
+    return _uniq(refs)
+
+def _visual_fact_signals(raw, keywords, limit=2, blocked_terms=()):
+    signals=[]
+    for item in _attribute_rows(raw):
+        name=_txt(item.get('name')); value=_txt(item.get('value'))
+        if any(word in name for word in keywords):
+            signals.extend(_visual_product_text(f'{name}：{value}',18,blocked_terms))
+        if len(signals)>=limit:break
+    return _uniq(signals)[:limit]
+
+def _visual_image_ids(raw, group):
+    return [f'IMG_{group.upper()}_{i:04d}' for i,_ in enumerate((raw.get('images') or {}).get(group,[]) or [],1)]
+
+def _visual_identity_terms(raw):
+    terms=[]
+    product=raw.get('product') or {}
+    for value in (_txt(product.get('brand')),):
+        if len(value.strip())>=2:terms.append(value.strip())
+    for item in _attribute_rows(raw):
+        name=_txt(item.get('name'))
+        value=_txt(item.get('value')).strip()
+        if any(key in name for key in ('品牌','商标')) and len(value)>=2:
+            terms.append(value)
+    return _uniq(terms)
+
+def _visual_signal_matches(signal, keywords):
+    return any(keyword in signal for keyword in keywords)
+
+def _canonical_visual_items(raw, items, tasks, valid_ids, plan_points=None, blocked_terms=()):
+    """Give every visual asset one job and a stable handoff to the next job."""
+    source=[x for x in items or [] if isinstance(x,dict)]
+    image_ids=_visual_image_ids(raw,'main' if tasks is MAIN_VISUAL_TASKS else 'detail')
+    count=min(len(tasks),max(len(source),len(image_ids)))
+    if not count:return []
+    plan_signals=[]
+    for point in plan_points or []:
+        if isinstance(point,dict):
+            plan_signals.extend(_visual_product_text(point.get('slogan') or point.get('consumerValue')))
+    result=[]
+    used_sources=set()
+    for index in range(count):
+        task=tasks[index]
+        eid=image_ids[index] if index<len(image_ids) else ''
+        src=None
+        if eid:
+            src=next((x for x in source if x.get('imageEvidenceId')==eid or x.get('representativeImageId')==eid),None)
+        if src is None:
+            src=next((x for i,x in enumerate(source) if i not in used_sources),None)
+        if src is not None:used_sources.add(source.index(src))
+        refs=_visual_refs(src,valid_ids) if src else []
+        if eid in valid_ids and eid not in refs:refs.append(eid)
+        if not refs:continue
+        signals=_visual_product_text(src.get('visualSignals') if src else [],18,blocked_terms)
+        signals=[x for x in signals if _visual_signal_matches(x,task['keywords'])]
+        if not signals and src:
+            signals=_visual_product_text(src.get('message') or src.get('observation') or src.get('businessMeaning'),18,blocked_terms)
+            signals=[x for x in signals if _visual_signal_matches(x,task['keywords'])]
+        fact_signals=_visual_fact_signals(raw,task['keywords'],2,blocked_terms)
+        task_plan_signals=[x for x in plan_signals if _visual_signal_matches(x,task['keywords'])]
+        signals=_uniq(signals+fact_signals+task_plan_signals)[:4]
+        if not signals:signals=list(task['signals'])
+        result.append({
+          'contentKey':task['contentKey'],'imageEvidenceId':eid or next((x for x in refs if x.startswith('IMG_')),refs[0]),
+          'imageRole':task['role'],'visualSignals':signals[:4],
+          'businessMeaning':f"本图只承担{task['role']}信息，不与其他图片重复",
+          'nextAction':task['nextAction'],'evidenceIds':_uniq(refs)
+        })
+    return result
+
+def _normalize_visual_continuity(exp, raw, valid_ids):
+    """Normalize main/detail responsibilities after model output and build the page handoff."""
+    exp=dict(exp or {})
+    plans=((exp.get('newProductPlans') or {}).get('plans') or [])
+    plan_points=plans[0].get('sellingPoints') if plans and isinstance(plans[0],dict) else []
+    blocked_terms=_visual_identity_terms(raw)
+    visual=exp.get('visualCommerce') or {}
+    detail=exp.get('detailCommerce') or {}
+    main=_canonical_visual_items(raw,visual.get('items'),MAIN_VISUAL_TASKS,valid_ids,plan_points,blocked_terms)
+    groups=_canonical_visual_items(raw,detail.get('contentGroups'),DETAIL_VISUAL_TASKS,valid_ids,plan_points,blocked_terms)
+    visual['items']=main
+    visual['professionalOpinion']='主图先让用户看懂商品、场景和选择入口，每张图只承担一个购买确认任务。'
+    detail['contentGroups']=[{
+      'contentKey':item.get('contentKey'),'type':item.get('role'),'representativeImageId':item.get('imageEvidenceId'),
+      'visualSignals':item.get('visualSignals'),'businessMeaning':item.get('businessMeaning'),
+      'nextAction':item.get('nextAction'),'evidenceIds':item.get('evidenceIds')
+    } for item in groups]
+    detail['professionalOpinion']='详情按场景、材质、结构、功能、规格和维护顺序连续证明产品，不重复主图已经讲清的内容。'
+    detail['pageSequence']=[{
+      'order':index+1,'contentKey':item.get('contentKey'),'mainImageRole':main[min(index,len(main)-1)].get('imageRole') if main else '主图信息',
+      'detailRole':item.get('role'),'handoff':f"主图先提出{item.get('role')}，详情继续给出可核对证明"
+    } for index,item in enumerate(DETAIL_VISUAL_TASKS[:len(groups)])]
+    claims=[]
+    for index,item in enumerate(DETAIL_VISUAL_TASKS[:min(len(main),len(groups))]):
+        main_item=main[index];detail_item=groups[index]
+        claims.append({
+          'claim':item['role'],'mainStatus':'expressed','detailStatus':'proven',
+          'reviewStatus':'partial','nextAction':item['nextAction'],
+          'evidenceIds':_uniq((main_item.get('evidenceIds') or [])+(detail_item.get('evidenceIds') or []))
+        })
+    exp['visualCommerce']=visual;exp['detailCommerce']=detail
+    if claims:exp['expressionContinuity']={'coreClaims':claims}
+    for plan in plans:
+        if not isinstance(plan,dict):continue
+        page_action=_visual_product_text(plan.get('pageAction'),18,blocked_terms)
+        if not page_action or any(term in _txt(plan.get('pageAction')) for term in VISUAL_EXCLUDED_TERMS):
+            plan['pageAction']='主图展示商品全貌与场景，详情依次证明材质、结构、功能和规格'
+        else:
+            plan['pageAction']='；'.join(page_action[:2])
+        points=plan.get('sellingPoints')
+        if isinstance(points,list):
+            plan['sellingPoints']=[p for p in points if isinstance(p,dict) and _visual_product_text(p.get('slogan') or p.get('consumerValue'),18,blocked_terms)]
+    return exp
+
 def _evidence_backed_solution(exp, valid_ids):
     exp=dict(exp or {})
     owner=exp.get('ownerOverview') or {};owner['cards']=_filter_evidence_items(owner.get('cards'),valid_ids);exp['ownerOverview']=owner
     visual=exp.get('visualCommerce') or {};visual['items']=_filter_evidence_items(visual.get('items'),valid_ids,True);exp['visualCommerce']=visual
+    detail=exp.get('detailCommerce') or {}
+    groups=[]
+    for item in detail.get('contentGroups') or []:
+        if not isinstance(item,dict):continue
+        clean=dict(item);refs=_visual_refs(item,valid_ids)
+        if refs:
+            clean['evidenceIds']=refs;groups.append(clean)
+    detail['contentGroups']=groups;exp['detailCommerce']=detail
     customer=exp.get('customerExperience') or {};customer['stages']=_filter_evidence_items(customer.get('stages'),valid_ids)
     signals=customer.get('signals') or {}
     for key in ('positive','questions','risks'):signals[key]=_filter_evidence_items(signals.get(key),valid_ids)
@@ -1021,6 +1270,13 @@ def ensure_experience_solution(analysis):
             exp['newProductPlans']['professionalOpinion']=(analysis.get('launchPlans') or {}).get('professionalOpinion')
     exp=_separate_qa_signals(exp)
     exp=_sanitize_report_language(_apply_selling_points(exp,raw,analysis['baseline']))
+    exp=_ensure_three_product_plans(exp,raw,analysis['baseline'])
+    # 核心工程模块缺失时，先使用同一批真实证据确定性补齐；不得带着失败审核输出正式报告。
+    exp=repair_core_solution_with_evidence(exp,raw,analysis['baseline'])
+    exp=_evidence_backed_solution(exp,valid_ids)
+    # 最后一轮把主图与详情收敛为连续的信息任务，避免模型把同一卖点复制到多张图。
+    exp=_normalize_visual_continuity(exp,raw,valid_ids)
+    exp=_evidence_backed_solution(exp,valid_ids)
     analysis['experienceSolution']=exp
     analysis['meta'].pop('fallbackReport',None)
     analysis['meta']['fallbackReport']=False
@@ -1031,11 +1287,11 @@ def ensure_experience_solution(analysis):
     validation=core_solution_diagnostics(exp)
     analysis['meta']['reportValidation']=validation
     if not validation['ok']:
-        # 审核是质量标记，不再阻断报告输出；缺失项在报告中显式提示，供人工复核。
-        analysis['meta']['reportReady']=True
+        analysis['meta']['reportReady']=False
         analysis['meta']['reportAuditPassed']=False
-        analysis['meta']['reportQuality']='needs_review'
-        analysis['meta']['reportNotice']='审核未通过，报告仍已生成。请优先补齐：'+', '.join(validation['missing'])
+        analysis['meta']['reportQuality']='blocked'
+        analysis['meta']['reportBlockedReason']='报告审核未通过，已停止生成。缺失：'+', '.join(validation['missing'])
+        analysis['meta'].pop('reportNotice',None)
         return analysis
     analysis['meta']['reportReady']=True
     analysis['meta']['reportAuditPassed']=True
@@ -1263,8 +1519,9 @@ def analyze(raw, progress=lambda *a:None):
     if use_ai and main_imgs:
         prompt='''任务B｜主图商业信息提炼。目标不是解释图片，而是让专业用户一眼看到“这张图在卖什么”。逐张提炼图片中可核验的商品信息标签，再给一个短动作。
 输出：
-{"visualThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"coreClaims":[],"imageRoles":[{"imageEvidenceId":"IMG_MAIN_0001","imageRole":"<=8字","visualSignals":["2-3个，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","evidenceIds":[],"confidence":0}],"evidenceDetail":[{"imageEvidenceId":"IMG_MAIN_0001","composition":"","textInfo":"","productSubject":"","patternColor":"","evidenceIds":[]}]}
-visualSignals必须来自图片可见文字、商品、场景或已确认参数，例如“40支新疆棉/六件套/免费仓储”，不能写抽象评价。
+{"visualThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"coreClaims":[],"imageRoles":[{"imageEvidenceId":"IMG_MAIN_0001","imageRole":"<=8字","visualSignals":["2-3个，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"product_overview|usage_scene|material_touch|structure_function|spec_choice","evidenceIds":[],"confidence":0}],"evidenceDetail":[{"imageEvidenceId":"IMG_MAIN_0001","composition":"","textInfo":"","productSubject":"","patternColor":"","evidenceIds":[]}]}
+visualSignals必须来自图片可见文字、商品、场景或已确认参数，例如“40支全棉/六件套/90×190cm”，不能写抽象评价。
+主图按商品全貌、使用场景、材质触感、结构功能、规格选择分工；每张图只承担一个主任务，不把品牌、专利、授权、价格、销量、物流或服务当作视觉卖点。
 '''
         z,e=call(prompt,{'evidence':compact_evidence(ledger,{'product','sales','image','attribute'},220)},6800,main_imgs)
         if e:out['modelErrors']['visual']=e
@@ -1289,7 +1546,8 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
     if use_ai and detail_imgs:
         prompt='''任务D｜详情页证明信息提炼。按4-6个信息任务组选代表图，不按图片流水账。每组只提炼2-4个图片信息标签和1条专业动作。
 输出：
-{"detailThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"contentGroups":[{"type":"品牌服务|套件组成|材质品质|产品功能|使用便利|花型选择|用户验证|其他","representativeImageId":"IMG_DETAIL_0001","visualSignals":["2-3项，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","imageEvidenceIds":[],"evidenceIds":[]}],"continuityChecks":[{"claim":"<=24字","mainImageEvidenceIds":[],"detailEvidenceIds":[],"status":"closed_loop|detail_missing|main_missing|conflict|review_pending","nextAction":"<=24字","evidenceIds":[]}],"pageSequence":[],"evidenceDetail":[]}
+{"detailThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"contentGroups":[{"type":"场景证明|材质证明|结构工艺|功能表现|规格适配|使用维护","representativeImageId":"IMG_DETAIL_0001","visualSignals":["2-3项，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"scene_problem|material_proof|structure_proof|function_proof|spec_adaptation|care_durability","imageEvidenceIds":[],"evidenceIds":[]}],"continuityChecks":[{"claim":"<=24字","mainImageEvidenceIds":[],"detailEvidenceIds":[],"status":"closed_loop|detail_missing|main_missing|conflict|review_pending","nextAction":"<=24字","evidenceIds":[]}],"pageSequence":[],"evidenceDetail":[]}
+详情顺序必须接续主图：场景证明 → 材质证明 → 结构工艺 → 功能表现 → 规格适配 → 使用维护；每组只负责一个购买疑问，不重复其他组。不要输出品牌、专利、授权、认证、奖项、包邮、物流、价格、销量、促销、客服或售后等唯一性/交易信息。
 '''
         z,e=call(prompt,{'visualDecision':out.get('visualDecision',{}),'evidence':compact_evidence(ledger,{'product','attribute','promotion','image'},360)},8200,detail_imgs)
         if e:out['modelErrors']['detail']=e
@@ -1330,14 +1588,14 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
     progress('plans','processing',95)
     if use_ai:
         context={'reportPlan':out.get('reportPlan',{}),'commercialDecision':out.get('commercialDecision',{}),'consumerResearch':out.get('consumerResearch',{}),'questionResearch':out.get('questionResearch',{}),'fashionDecision':out.get('fashionDecision',{}),'competitionDecision':out.get('competitionDecision',{}),'productDecision':out.get('productDecision',{}),'visualDecision':out.get('visualDecision',{}),'merchandisingDecision':out.get('merchandisingDecision',{}),'detailDecision':out.get('detailDecision',{}),'baseline':base}
-        prompt='''任务F｜下一款方案。面向老板先做决策卡，再让专业用户展开细节。每套默认只保留：来源等级、为什么做、产品动作、页面动作、验证项。
-至少1套，证据充分2-3套。
+        prompt='''任务F｜下一款产品开品方案。必须输出3套不同的产品新方案；每套只保留四个核心字段：来源等级、名称、产品动作、页面动作。产品动作是核心，必须具体说明下一款产品本身怎么改；页面动作必须说明该方案自己的完整主图证据链与详情图证据链如何承接。不要扩展字段。产品参考图由生成环节处理，不要求模型输出。
+必须正好3套，顺序固定为：证据驱动优化、反馈驱动升级、探索性方向。每套名称必须是简洁的“XX款”，不能直接复用商品长标题；三个方案不得只是换名字，产品结构、材质、规格、工艺、配色或使用体验上必须有可辨认差异。
 来源等级：
 - 证据驱动优化：直接来自当前商品页面/参数/评论；
 - 反馈驱动升级：直接来自消费者体验差异/购前关注；
-- 探索性方向：设计创新或扩展想法，必须明确标记，不能当作已验证结论。
+- 探索性方向：设计创新或扩展想法，必须明确标记为待小样验证，不能当作已验证结论。
 输出：
-{"professionalOpinion":"<=45字","plans":[{"sourceType":"证据驱动优化|反馈驱动升级|探索性方向","type":"现有基础优化|强化体验区分|强化设计选择|其他","name":"<=18字","whyThisPlan":"<=32字","visualReferenceImageIds":[],"productAction":"<=28字","pageAction":"<=28字","validation":"<=20字","evidenceIds":[],"confidence":0}],"nextValidation":[]}
+{"professionalOpinion":"<=45字","plans":[{"sourceType":"证据驱动优化|反馈驱动升级|探索性方向","name":"<=18字且以款结尾","productAction":"<=45字，明确结构/材质/规格/工艺/配色/包装中实际要改的内容","pageAction":"<=36字，说明该方案完整主图与详情证据链如何表达产品改进"}]}
 '''
         z,e=call(prompt,context,9800)
         if e:out['modelErrors']['plans']=e

@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>三笙 · 安装介绍</title>
+  <style>
+    :root{
+      --paper:#fff;--bg:#f6f2eb;--ink:#161513;--muted:#6f685f;--line:#e5ddd2;
+      --good:#1aa98c;--blue:#4a74c7;--orange:#e48b4f;--rose:#bb5f9a;--dark:#171717;
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif}
+    img{display:block;max-width:100%}
+    a{color:inherit;text-decoration:none}
+    .wrap{width:min(1280px,calc(100% - 48px));margin:0 auto}
+    .hero{padding:28px 0 14px}
+    .hero-grid{display:grid;grid-template-columns:1fr 1.02fr;gap:30px;align-items:center}
+    .kicker{display:inline-block;padding:10px 16px;border-radius:999px;background:#16816f;color:#fff;font-size:12px;font-weight:800;letter-spacing:.08em}
+    h1{margin:18px 0 14px;font-size:68px;line-height:1.04;letter-spacing:0}
+    .hero-copy{font-size:20px;line-height:1.75;color:#5f594f;max-width:540px;margin:0}
+    .hero-points{display:flex;flex-wrap:wrap;gap:14px;margin-top:28px}
+    .point{padding:12px 20px;border-radius:999px;background:#f4f7f7;border:1px solid #dbd5cb;font-size:16px;color:#3a342f}
+    .hero-visual{padding:26px;border-radius:28px;background:linear-gradient(180deg,#fff 0%,#f8f4ee 100%);border:1px solid #eadfd2;box-shadow:0 24px 70px rgba(51,36,23,.16)}
+    .hero-visual img{width:100%;height:auto;border-radius:16px}
+    .section{padding:20px 0 26px}
+    .section-head{display:flex;align-items:baseline;gap:14px;margin:8px 0 18px}
+    .section-head h2{margin:0;font-size:28px;line-height:1.2}
+    .section-head p{margin:0;color:#8a8177;font-size:12px}
+    .install-intro{display:grid;grid-template-columns:1.1fr .9fr;gap:34px;align-items:center;background:var(--paper);border:1px solid var(--line);border-radius:24px;padding:28px 28px 26px}
+    .install-intro h3{margin:0 0 12px;font-size:30px;line-height:1.2}
+    .install-intro p{margin:0;color:var(--muted);font-size:16px;line-height:1.8}
+    .install-shape{display:grid;place-items:center;min-height:290px;background:linear-gradient(160deg,#fff7f0 0%,#f0f9f7 100%);border-radius:22px}
+    .browser-stack{width:min(360px,100%);padding:20px 16px 14px;border-radius:26px;background:#fff;box-shadow:0 10px 28px rgba(48,36,24,.12);border:1px solid #eadfd2}
+    .browser-top{height:20px;border-radius:999px;background:#f2e6db;margin-bottom:16px}
+    .browser-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+    .browser-card{padding:12px 10px;border-radius:16px;border:1px solid #e6ddd2;background:#fbfaf8;font-size:12px;line-height:1.5}
+    .browser-card b{display:block;font-size:14px;margin-bottom:4px}
+    .browser-card.o{background:#fff6ee}.browser-card.g{background:#eef9f7}.browser-card.b{background:#f1f5fd}
+    .browser-footer{height:14px;width:72%;margin:16px auto 0;border-radius:999px;background:#c9b7a3}
+    .flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+    .flow-card{background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:18px;min-width:0}
+    .flow-card img{border-radius:14px;border:1px solid #eee7dc;background:#fff}
+    .flow-card span{display:inline-block;margin-top:12px;font-size:12px;color:#90867a;font-weight:800}
+    .flow-card strong{display:block;margin-top:6px;font-size:18px;line-height:1.4}
+    .flow-card p{margin:8px 0 0;font-size:13px;line-height:1.7;color:var(--muted)}
+    .step-block{margin-top:18px;background:var(--paper);border:1px solid var(--line);border-radius:22px;padding:24px}
+    .step-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+    .step-head h3{margin:0;font-size:26px}
+    .step-head small{font-size:12px;color:#8d8478}
+    .step-list{display:grid;gap:16px}
+    .step-row{display:grid;grid-template-columns:280px 1fr;gap:20px;align-items:start;padding:18px;border-radius:18px;background:#fbfaf8;border:1px solid #e8e0d5}
+    .step-row figure{margin:0}
+    .step-row img{border-radius:14px;border:1px solid #e8e0d5;width:100%;height:auto}
+    .step-copy b{display:inline-block;padding:8px 12px;border-radius:999px;background:#f0f6f5;color:#186f61;font-size:12px;letter-spacing:.08em}
+    .step-copy h4{margin:12px 0 8px;font-size:22px;line-height:1.35}
+    .step-copy p{margin:0 0 10px;color:var(--muted);font-size:15px;line-height:1.75}
+    .step-copy ul{margin:10px 0 0;padding-left:18px;color:#4e463f}
+    .step-copy li{margin:6px 0;font-size:14px;line-height:1.65}
+    .gallery{margin-top:18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+    .gallery-card{background:var(--paper);border:1px solid var(--line);border-radius:18px;padding:14px}
+    .gallery-card img{border-radius:12px;border:1px solid #eae1d6}
+    .gallery-card strong{display:block;margin-top:10px;font-size:16px}
+    .gallery-card p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.7}
+    .footer-note{margin:22px 0 36px;padding:18px 20px;border-radius:16px;background:#1a1816;color:#f7f2eb;font-size:14px;line-height:1.8}
+    @media (max-width:980px){
+      .hero-grid,.install-intro,.step-row{grid-template-columns:1fr}
+      .flow,.gallery{grid-template-columns:1fr 1fr}
+      h1{font-size:50px}
+    }
+    @media (max-width:680px){
+      .wrap{width:min(100% - 24px,1280px)}
+      .flow,.gallery{grid-template-columns:1fr}
+      h1{font-size:38px}
+      .hero-copy{font-size:17px}
+      .step-row{padding:14px}
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="hero">
+      <div class="hero-grid">
+        <div>
+          <div class="kicker">INSTALL GUIDE</div>
+          <h1>三笙<br>安装介绍</h1>
+          <p class="hero-copy">这是第一次使用的入口。先把扩展装上，再启动本地服务，最后打开商品详情页开始采集。下面用图片把每一步讲清楚。</p>
+          <div class="hero-points">
+            <div class="point">扩展只装一次</div>
+            <div class="point">服务双击启动</div>
+            <div class="point">商品页再采集</div>
+          </div>
+        </div>
+        <div class="hero-visual">
+          <img src="assets/install/hero.png" alt="安装介绍头图">
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>安装说明</h2>
+        <p>先看顺序，再看图示</p>
+      </div>
+      <div class="install-intro">
+        <div>
+          <h3>按这个顺序做，最省事</h3>
+          <p>先加载 extension 文件夹，再双击启动本地服务，然后进入单个商品详情页。弹窗里会显示服务状态和采集入口，版本一致时就可以直接开始。</p>
+        </div>
+        <div class="install-shape">
+          <div class="browser-stack">
+            <div class="browser-top"></div>
+            <div class="browser-grid">
+              <div class="browser-card o"><b>1 扩展</b>加载已解压的扩展程序</div>
+              <div class="browser-card g"><b>2 服务</b>双击 start-tmall-ai.command</div>
+              <div class="browser-card b"><b>3 商品页</b>打开单个商品详情页</div>
+            </div>
+            <div class="browser-footer"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="flow">
+        <article class="flow-card">
+          <img src="assets/install/step-1.png" alt="加载扩展文件夹">
+          <span>STEP 01</span>
+          <strong>加载扩展文件夹</strong>
+          <p>Chrome 里只需要加载一次 extension 文件夹，后面就不用再装。</p>
+        </article>
+        <article class="flow-card">
+          <img src="assets/install/step-2.png" alt="启动本地服务">
+          <span>STEP 02</span>
+          <strong>启动本地服务</strong>
+          <p>双击 start-tmall-ai.command，让服务先跑起来，再回到弹窗确认状态。</p>
+        </article>
+        <article class="flow-card">
+          <img src="assets/install/step-3.png" alt="打开商品详情页">
+          <span>STEP 03</span>
+          <strong>打开商品详情页</strong>
+          <p>先登录淘宝或天猫，再进入单个商品详情页，采集入口才会工作。</p>
+        </article>
+        <article class="flow-card">
+          <img src="assets/install/step-4.png" alt="开始深度采集">
+          <span>STEP 04</span>
+          <strong>开始深度采集</strong>
+          <p>选择评论样本后点击开始，采集与分析会沿着同一条链路跑完。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="step-block">
+      <div class="step-head">
+        <h3>图文演示</h3>
+        <small>一张图，一个动作</small>
+      </div>
+      <div class="step-list">
+        <div class="step-row">
+          <figure><img src="assets/install/step-1.png" alt="步骤一截图"></figure>
+          <div class="step-copy">
+            <b>01</b>
+            <h4>把扩展载入 Chrome</h4>
+            <p>打开扩展管理页，点“加载已解压的扩展程序”，选择当前仓库里的 `extension` 文件夹。</p>
+            <ul>
+              <li>只需要装一次。</li>
+              <li>装好后浏览器右上角会出现图标。</li>
+              <li>如果没看到，先确认开发者模式已打开。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step-row">
+          <figure><img src="assets/install/step-2.png" alt="步骤二截图"></figure>
+          <div class="step-copy">
+            <b>02</b>
+            <h4>把本地服务启动起来</h4>
+            <p>双击 `start-tmall-ai.command`，让后端先运行。弹窗里会显示服务状态、版本和模型配置。</p>
+            <ul>
+              <li>状态正常后再去打开商品页。</li>
+              <li>版本不一致时，先重启本包服务。</li>
+              <li>配置项会保存在本机，不进 Chrome。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step-row">
+          <figure><img src="assets/install/step-3.png" alt="步骤三截图"></figure>
+          <div class="step-copy">
+            <b>03</b>
+            <h4>进入单个商品详情页</h4>
+            <p>先登录淘宝或天猫，再打开一个具体商品详情页。这个工具不是在列表页跑的。</p>
+            <ul>
+              <li>弹窗里会提示当前商品状态。</li>
+              <li>进入详情页后再点“开始深度采集”。</li>
+              <li>中途停止也能保留进度。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="step-row">
+          <figure><img src="assets/install/step-4.png" alt="步骤四截图"></figure>
+          <div class="step-copy">
+            <b>04</b>
+            <h4>选择样本后开始采集</h4>
+            <p>在弹窗里选 50、100、500、全部或自定义样本，再点击开始，采集和分析会串成一条链。</p>
+            <ul>
+              <li>想快看结果就用 50 条。</li>
+              <li>常规建议 500 条。</li>
+              <li>采集过程中可随时停止并继续。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <h2>补充说明</h2>
+        <p>把关键点讲透</p>
+      </div>
+      <div class="gallery">
+        <div class="gallery-card">
+          <img src="assets/install/step-2.png" alt="本地服务提示">
+          <strong>先看服务状态</strong>
+          <p>弹窗里先确认“本地服务 ✓”再继续，不然采集不会真正开始。</p>
+        </div>
+        <div class="gallery-card">
+          <img src="assets/install/step-4.png" alt="采集入口提示">
+          <strong>再看采集入口</strong>
+          <p>样本档位和按钮都在弹窗里，点一下就能开始，不需要另外找页面。</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer-note">装完以后，日常使用就三步：启动服务、打开商品页、点“开始深度采集”。</div>
+  </main>
+</body>
+</html>

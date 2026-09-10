@@ -5,8 +5,8 @@
   "description": "跨类目解析商品标题、主图、详情、活动、SKU、动态参数、评论与问答。",
   "permissions": ["activeTab", "scripting", "tabs", "alarms", "cookies"],
   "host_permissions": [
-    "http://127.0.0.1:3300/*",
-    "http://localhost:3300/*",
+    "http://127.0.0.1:17962/*",
+    "http://localhost:17962/*",
     "http://127.0.0.1/*",
     "http://localhost/*",
     "https://*.taobao.com/*",

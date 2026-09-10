@@ -1,4 +1,6 @@
-const API_BASE='http://127.0.0.1:3300/api/collector/product-page'
+// V9.3.0 compatibility reference. The recommended manual collector is the
+// root `extension/`; this copy submits snapshots to the current local service.
+const API_BASE='http://127.0.0.1:17962'
 
 async function capture(tabId){
   const result=await chrome.scripting.executeScript({target:{tabId},func:()=>{
@@ -102,7 +104,7 @@ async function capture(tabId){
       platform
     }
     const structured={
-      meta:{...collection,url,imageClassificationVersion:'strict-v1',collectorVersion:'9.2.2'},
+      meta:{...collection,url,imageClassificationVersion:'strict-v1',collectorVersion:'9.3.0'},
       category:{candidates:categoryCandidates,breadcrumb},
       product:{itemId,skuId,title,shop,brand:attributes.find(item=>/^品牌$/.test(item.name))?.value||'',url,platform},
       sales:{currentPrice,originalPrice,sold,ranking},
@@ -130,7 +132,7 @@ function isProductUrl(url=''){return /^https:\/\/(?:item\.jd\.com\/\d+\.html|ite
 async function reportAuthState(){
   try{
     const [taobaoCookies,jdCookies]=await Promise.all([chrome.cookies.getAll({domain:'.taobao.com'}),chrome.cookies.getAll({domain:'.jd.com'})])
-    const response=await fetch(`${API_BASE}/auth-heartbeat`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:chrome.runtime.getManifest().version,platforms:{taobao:{loggedIn:taobaoCookies.some(cookie=>/tracknick|cookie2|_tb_token_|sgcookie/i.test(cookie.name))},jd:{loggedIn:jdCookies.some(cookie=>/pin|thor|unick/i.test(cookie.name))}}})})
+    const response=await fetch(`${API_BASE}/health`,{cache:'no-store'})
     return response.ok
   }catch(error){console.error('[三笙登录态上报]',error);return false}
 }
@@ -144,8 +146,11 @@ async function captureAndSend(tab,{force=false}={}){
     await chrome.action.setBadgeText({tabId:tab.id,text:'采'})
     await chrome.action.setBadgeBackgroundColor({tabId:tab.id,color:'#2563EB'})
     const payload=await capture(tab.id)
-    const response=await fetch(`${API_BASE}/capture`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
-    if(!response.ok)throw new Error(await response.text())
+    const raw=payload?.raw||payload?.structured||payload
+    const response=await fetch(`${API_BASE}/api/analyze-current`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw,allowPartialReviews:true})})
+    const result=await response.json().catch(()=>({ok:false,error:'本地服务返回内容无法解析'}))
+    if(!response.ok||!result.ok)throw new Error(result.error||`本地服务 HTTP ${response.status}`)
+    if(result.taskUrl)await chrome.tabs.create({url:result.taskUrl,active:false})
     await chrome.action.setBadgeText({tabId:tab.id,text:'OK'})
     await chrome.action.setBadgeBackgroundColor({tabId:tab.id,color:'#155C4E'})
     setTimeout(()=>chrome.action.setBadgeText({tabId:tab.id,text:''}),2500)
@@ -157,40 +162,15 @@ async function captureAndSend(tab,{force=false}={}){
   }
 }
 
-chrome.tabs.onUpdated.addListener((tabId,changeInfo,tab)=>{if(changeInfo.status==='complete'&&isProductUrl(tab.url))setTimeout(()=>captureAndSend({...tab,id:tabId}),2500)})
 chrome.tabs.onRemoved.addListener(tabId=>{for(const key of lastCaptured.keys())if(key.startsWith(`${tabId}:`))lastCaptured.delete(key)})
 chrome.action.onClicked.addListener(tab=>captureAndSend(tab,{force:true}))
 
-let queueBusy=false
-let queueBackoffMs=1000
-async function processCaptureQueue(){
-  if(queueBusy)return
-  queueBusy=true
-  let tab
-  try{
-    const response=await fetch(`${API_BASE}/next`)
-    if(response.status===204){queueBackoffMs=Math.min(queueBackoffMs*1.5,15_000);return}
-    if(!response.ok)throw new Error(`任务队列 HTTP ${response.status}`)
-    const task=await response.json()
-    tab=await chrome.tabs.create({url:task.url,active:false})
-    await new Promise((resolve,reject)=>{
-      const timeout=setTimeout(()=>{chrome.tabs.onUpdated.removeListener(listener);reject(new Error('商品页加载超时'))},45_000)
-      const listener=(tabId,changeInfo,updated)=>{if(tabId===tab.id&&changeInfo.status==='complete'){clearTimeout(timeout);chrome.tabs.onUpdated.removeListener(listener);resolve(updated)}}
-      chrome.tabs.onUpdated.addListener(listener)
-    })
-    await new Promise(resolve=>setTimeout(resolve,3500))
-    await captureAndSend(await chrome.tabs.get(tab.id),{force:true})
-    queueBackoffMs=1000
-  }catch(error){console.error('[三笙采集队列]',error);queueBackoffMs=Math.min(queueBackoffMs*2,30_000)}
-  finally{if(tab?.id)await chrome.tabs.remove(tab.id).catch(()=>{});queueBusy=false;setTimeout(processCaptureQueue,queueBackoffMs)}
-}
-
-chrome.runtime.onInstalled.addListener(()=>{chrome.alarms.create('sansong-product-queue',{periodInMinutes:.5});processCaptureQueue()})
-chrome.runtime.onStartup.addListener(()=>{chrome.alarms.create('sansong-product-queue',{periodInMinutes:.5});processCaptureQueue()})
-chrome.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='sansong-product-queue')processCaptureQueue();if(alarm.name==='sansong-auth-heartbeat')reportAuthState()})
-chrome.alarms.create('sansong-product-queue',{periodInMinutes:.5})
+// The old remote /next queue belonged to a retired service and is deliberately
+// disabled. V9.3.0 is manual single-product collection only.
+chrome.runtime.onInstalled.addListener(()=>reportAuthState())
+chrome.runtime.onStartup.addListener(()=>reportAuthState())
+chrome.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='sansong-auth-heartbeat')reportAuthState()})
 chrome.alarms.create('sansong-auth-heartbeat',{periodInMinutes:1})
-processCaptureQueue()
 reportAuthState()
 chrome.runtime.onMessage.addListener((message,_sender,sendResponse)=>{if(message?.type!=='SANSONG_COLLECTOR_WAKE')return;reportAuthState().then(connected=>sendResponse({connected})).catch(()=>sendResponse({connected:false}));return true})
 chrome.cookies.onChanged.addListener(change=>{if(/(?:^|\.)(?:taobao|tmall|jd)\.com$/i.test(change.cookie.domain))setTimeout(reportAuthState,300)})

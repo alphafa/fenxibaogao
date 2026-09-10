@@ -5,14 +5,16 @@ VERSION="9.3.0"
 SERVER="$ROOT/server"
 LOG="$SERVER/v9_1_0.log"
 
-health_version() {
+health_identity() {
   curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("serverVersion",""))
+try:
+ d=json.load(sys.stdin); print(d.get("serverVersion","")+"|"+d.get("configPath",""))
 except: print("")' 2>/dev/null
 }
 
-RUNNING="$(health_version || true)"
-if [ "$RUNNING" = "$VERSION" ]; then
+EXPECTED="$VERSION|$SERVER/config.json"
+RUNNING="$(health_identity || true)"
+if [ "$RUNNING" = "$EXPECTED" ]; then
   open "http://127.0.0.1:$PORT/"
   exit 0
 fi
@@ -39,8 +41,8 @@ end tell
 APPLESCRIPT
 
 for i in {1..40}; do
-  V="$(health_version || true)"
-  if [ "$V" = "$VERSION" ]; then
+  IDENTITY="$(health_identity || true)"
+  if [ "$IDENTITY" = "$EXPECTED" ]; then
     open "http://127.0.0.1:$PORT/"
     exit 0
   fi

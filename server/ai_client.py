@@ -25,8 +25,12 @@ def load_config():
     cfg['api_base'] = os.getenv('AI_API_BASE', cfg.get('api_base','https://api.bananarouter.com/v1')).rstrip('/')
     cfg['api_key'] = os.getenv('AI_API_KEY', cfg.get('api_key',''))
     cfg['model'] = os.getenv('AI_MODEL', cfg.get('model',''))
+    cfg['image_api_base'] = os.getenv('IMAGE_API_BASE', cfg.get('image_api_base','')).rstrip('/')
+    cfg['image_api_key'] = os.getenv('IMAGE_API_KEY', cfg.get('image_api_key',''))
+    cfg['image_model'] = os.getenv('IMAGE_MODEL', cfg.get('image_model',''))
     cfg['chat_path'] = str(cfg.get('chat_path','/chat/completions'))
     cfg['models_path'] = str(cfg.get('models_path','/models'))
+    cfg['image_models_path'] = str(cfg.get('image_models_path','/models'))
     try: cfg['temperature'] = float(os.getenv('AI_TEMPERATURE', cfg.get('temperature',0.2)))
     except Exception: cfg['temperature'] = 0.2
     try: cfg['timeout'] = int(os.getenv('AI_TIMEOUT', cfg.get('timeout',120)))
@@ -68,6 +72,33 @@ def _headers(c):
     h.update(c.get('extra_headers',{}))
     return h
 
+def image_channel(c=None):
+    """Return an image-provider config, falling back to the analysis channel for compatibility."""
+    source=dict(c or load_config())
+    source['api_base']=str(source.get('image_api_base') or source.get('api_base') or '').rstrip('/')
+    source['api_key']=str(source.get('image_api_key') or source.get('api_key') or '')
+    source['models_path']=str(source.get('image_models_path') or '/models')
+    return source
+
+def probe_image_api(timeout=15):
+    c=image_channel()
+    model=str(c.get('image_model') or '').strip()
+    if not c.get('api_base') or not c.get('api_key') or not model:
+        return {'ok':False,'stage':'image_config','error':'生图渠道 API Base、API Key 或生图模型未配置'}
+    try:
+        req=urllib.request.Request(_join(c['api_base'],c['models_path']),headers=_headers(c),method='GET')
+        with urllib.request.urlopen(req,timeout=min(timeout,c['timeout']),context=_ssl_context(c)) as r:
+            obj=json.loads(r.read().decode('utf-8','ignore') or '{}')
+        ids=[x.get('id') for x in (obj.get('data') or []) if isinstance(x,dict)]
+        return {'ok':True,'stage':'image_models','http':200,'imageModel':model,
+                'imageModelFound':(model in ids) if ids else None,'modelsCount':len(ids),
+                'separateChannel':bool(c.get('image_api_base') or c.get('image_api_key'))}
+    except urllib.error.HTTPError as e:
+        body=e.read().decode('utf-8','ignore')
+        return {'ok':False,'stage':'image_models','http':e.code,'error':body[:500] or str(e),'imageModel':model}
+    except Exception as e:
+        return {'ok':False,'stage':'image_network','error':str(e),'imageModel':model}
+
 def _join(base,path):
     path='/' + str(path or '').lstrip('/')
     return base.rstrip('/') + path
@@ -83,7 +114,10 @@ def probe_model_api(timeout=15):
         with urllib.request.urlopen(req,timeout=min(timeout,c['timeout']),context=_ssl_context(c)) as r:
             obj=json.loads(r.read().decode('utf-8','ignore') or '{}')
         ids=[x.get('id') for x in (obj.get('data') or []) if isinstance(x,dict)]
-        return {'ok':True,'stage':'models','http':200,'modelFound':(c['model'] in ids) if ids else None,'model':c['model'],'modelsCount':len(ids)}
+        image_model=str(c.get('image_model') or '').strip()
+        return {'ok':True,'stage':'models','http':200,'modelFound':(c['model'] in ids) if ids else None,'model':c['model'],
+                'imageModelConfigured':bool(image_model),'imageModel':image_model or None,
+                'imageModelFound':(image_model in ids) if ids and image_model else None,'modelsCount':len(ids)}
     except urllib.error.HTTPError as e:
         body=e.read().decode('utf-8','ignore')
         return {'ok':False,'stage':'models','http':e.code,'error':body[:500] or str(e)}
@@ -104,6 +138,70 @@ def _parse_json(s):
 
 def _do_post(c,payload):
     req=urllib.request.Request(_join(c['api_base'],c['chat_path']),data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=_headers(c),method='POST')
+    with urllib.request.urlopen(req,timeout=c['timeout'],context=_ssl_context(c)) as r:
+        return json.loads(r.read().decode('utf-8','ignore'))
+
+def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=None):
+    """Generate commerce images through an OpenAI-compatible images endpoint.
+
+    Image generation is deliberately separate from chat generation: operators can
+    keep a text model for analysis and configure a dedicated image model/path in
+    config.json. The return value is the provider response so the server can
+    persist both URL and base64 responses locally.
+    """
+    c=image_channel()
+    if c.get('_config_error'):
+        raise RuntimeError(c['_config_error'])
+    if not c.get('api_key'):
+        raise RuntimeError('未配置 API Key，无法生成图片。')
+    image_model=str(model or c.get('image_model') or '').strip()
+    if not image_model:
+        raise RuntimeError('未配置独立的生图模型 image_model。请在本地服务配置页与分析模型一起填写。')
+    try: count=max(1,min(8,int(n)))
+    except Exception: count=1
+    payload={
+        'model':image_model,
+        'prompt':str(prompt or '').strip(),
+        'size':str(size or c.get('image_size') or '1024x1024'),
+        'n':count,
+    }
+    quality=c.get('image_quality')
+    if quality: payload['quality']=quality
+    style=c.get('image_style')
+    if style: payload['style']=style
+    path=str(c.get('image_path') or '/images/generations')
+    last=None
+    refs=[str(x).strip() for x in (reference_images or []) if str(x).strip()][:4]
+    variants=[]
+    if refs:
+        # OpenAI-compatible image gateways use different names for image guidance.
+        # Try the common JSON shapes, but never silently drop a requested reference.
+        for key in ('image','reference_images','images'):
+            v=dict(payload); v[key]=refs[0] if key=='image' and len(refs)==1 else refs; variants.append(v)
+    else:
+        variants=[payload]
+    # Gateways differ: retry without optional fields before failing the job.
+    if 'quality' in payload or 'style' in payload:
+        clean=[]
+        for item in variants:
+            v=dict(item); v.pop('quality',None); v.pop('style',None); clean.append(v)
+        variants.extend(clean)
+    for attempt in range(c['retries']+1):
+        for variant in variants:
+            try:
+                return _do_post_path(c,path,variant)
+            except urllib.error.HTTPError as e:
+                body=e.read().decode('utf-8','ignore')
+                last=RuntimeError(f'图片接口 HTTP {e.code}: {body[:900]}')
+                if e.code not in (400,408,409,429,500,502,503,504): raise last
+            except Exception as e:
+                last=RuntimeError(f'图片接口调用失败: {e}')
+        if attempt<c['retries']:
+            time.sleep(min(1.5*(attempt+1),4))
+    raise last or RuntimeError('图片接口调用失败')
+
+def _do_post_path(c,path,payload):
+    req=urllib.request.Request(_join(c['api_base'],path),data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=_headers(c),method='POST')
     with urllib.request.urlopen(req,timeout=c['timeout'],context=_ssl_context(c)) as r:
         return json.loads(r.read().decode('utf-8','ignore'))
 
