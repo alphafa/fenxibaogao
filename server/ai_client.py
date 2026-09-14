@@ -3,6 +3,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = '9.3.0'
+IMAGE_QUALITY_OPTIONS = ('auto', 'low', 'medium', 'high', 'xhigh', 'max')
+
+def normalize_image_quality(value):
+    value = str(value or '').strip().lower()
+    return value if value in IMAGE_QUALITY_OPTIONS else ''
 
 def load_config():
     cfg = {}
@@ -28,6 +33,31 @@ def load_config():
     cfg['image_api_base'] = os.getenv('IMAGE_API_BASE', cfg.get('image_api_base','')).rstrip('/')
     cfg['image_api_key'] = os.getenv('IMAGE_API_KEY', cfg.get('image_api_key',''))
     cfg['image_model'] = os.getenv('IMAGE_MODEL', cfg.get('image_model',''))
+    cfg['image_quality'] = normalize_image_quality(os.getenv('IMAGE_QUALITY', cfg.get('image_quality','')))
+    raw_image_models = os.getenv('IMAGE_MODELS', cfg.get('image_models', []))
+    if isinstance(raw_image_models, str):
+        raw_image_models = [x.strip() for x in raw_image_models.replace('\n', ',').split(',') if x.strip()]
+    if not isinstance(raw_image_models, list):
+        raw_image_models = []
+    image_models = []
+    for item in raw_image_models:
+        if isinstance(item, dict):
+            model_id = str(item.get('id') or item.get('model') or '').strip()
+            label = str(item.get('label') or model_id).strip()
+            quality = normalize_image_quality(item.get('quality'))
+        else:
+            model_id = str(item or '').strip()
+            label = model_id
+            quality = ''
+        if model_id and not any(x['id'] == model_id for x in image_models):
+            image_models.append({'id': model_id, 'label': label or model_id, 'quality': quality})
+    default_image_model = str(cfg['image_model'] or '').strip()
+    if default_image_model and not any(x['id'] == default_image_model for x in image_models):
+        image_models.insert(0, {'id': default_image_model, 'label': default_image_model, 'quality': cfg['image_quality']})
+    for item in image_models:
+        if not item.get('quality'):
+            item['quality'] = cfg['image_quality']
+    cfg['image_models'] = image_models
     cfg['chat_path'] = str(cfg.get('chat_path','/chat/completions'))
     cfg['models_path'] = str(cfg.get('models_path','/models'))
     cfg['image_models_path'] = str(cfg.get('image_models_path','/models'))
@@ -37,6 +67,8 @@ def load_config():
     except Exception: cfg['timeout'] = 120
     try: cfg['retries'] = max(0, int(cfg.get('retries',2)))
     except Exception: cfg['retries'] = 2
+    try: cfg['image_concurrency'] = max(1, min(5, int(os.getenv('IMAGE_CONCURRENCY', cfg.get('image_concurrency',5)))))
+    except Exception: cfg['image_concurrency'] = 5
     cfg['extra_headers'] = cfg.get('extra_headers',{}) or {}
     cfg['ca_bundle'] = str(cfg.get('ca_bundle','') or '')
     cfg['ssl_verify'] = bool(cfg.get('ssl_verify', True))
@@ -80,18 +112,48 @@ def image_channel(c=None):
     source['models_path']=str(source.get('image_models_path') or '/models')
     return source
 
+def image_model_options(c=None):
+    """Return configured image models while keeping the legacy single-model field."""
+    source = c if isinstance(c, dict) else load_config()
+    options = source.get('image_models') or []
+    result = []
+    for item in options:
+        if isinstance(item, dict):
+            model_id = str(item.get('id') or item.get('model') or '').strip()
+            label = str(item.get('label') or model_id).strip()
+            quality = normalize_image_quality(item.get('quality'))
+        else:
+            model_id = str(item or '').strip()
+            label = model_id
+            quality = ''
+        if model_id and not any(x['id'] == model_id for x in result):
+            result.append({'id': model_id, 'label': label or model_id, 'quality': quality})
+    legacy = str(source.get('image_model') or '').strip()
+    if legacy and not any(x['id'] == legacy for x in result):
+        result.insert(0, {'id': legacy, 'label': legacy, 'quality': normalize_image_quality(source.get('image_quality'))})
+    default_quality = normalize_image_quality(source.get('image_quality'))
+    for item in result:
+        if not item.get('quality'):
+            item['quality'] = default_quality
+    return result
+
 def probe_image_api(timeout=15):
     c=image_channel()
-    model=str(c.get('image_model') or '').strip()
-    if not c.get('api_base') or not c.get('api_key') or not model:
+    options=image_model_options(c)
+    model=str(c.get('image_model') or (options[0]['id'] if options else '')).strip()
+    if not c.get('api_base') or not c.get('api_key') or not options:
         return {'ok':False,'stage':'image_config','error':'生图渠道 API Base、API Key 或生图模型未配置'}
     try:
         req=urllib.request.Request(_join(c['api_base'],c['models_path']),headers=_headers(c),method='GET')
         with urllib.request.urlopen(req,timeout=min(timeout,c['timeout']),context=_ssl_context(c)) as r:
             obj=json.loads(r.read().decode('utf-8','ignore') or '{}')
         ids=[x.get('id') for x in (obj.get('data') or []) if isinstance(x,dict)]
+        model_checks=[{'id':item['id'],'label':item['label'],'quality':item.get('quality') or '',
+                       'found':(item['id'] in ids) if ids else None} for item in options]
         return {'ok':True,'stage':'image_models','http':200,'imageModel':model,
                 'imageModelFound':(model in ids) if ids else None,'modelsCount':len(ids),
+                'imageModels':model_checks,
+                'allImageModelsFound':all(item['found'] is not False for item in model_checks),
                 'separateChannel':bool(c.get('image_api_base') or c.get('image_api_key'))}
     except urllib.error.HTTPError as e:
         body=e.read().decode('utf-8','ignore')
@@ -141,7 +203,7 @@ def _do_post(c,payload):
     with urllib.request.urlopen(req,timeout=c['timeout'],context=_ssl_context(c)) as r:
         return json.loads(r.read().decode('utf-8','ignore'))
 
-def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=None):
+def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=None, quality=None, style=None):
     """Generate commerce images through an OpenAI-compatible images endpoint.
 
     Image generation is deliberately separate from chat generation: operators can
@@ -165,10 +227,10 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
         'size':str(size or c.get('image_size') or '1024x1024'),
         'n':count,
     }
-    quality=c.get('image_quality')
-    if quality: payload['quality']=quality
-    style=c.get('image_style')
-    if style: payload['style']=style
+    quality_value=normalize_image_quality(c.get('image_quality') if quality is None else quality)
+    if quality_value: payload['quality']=quality_value
+    style_value=c.get('image_style') if style is None else style
+    if style_value: payload['style']=style_value
     path=str(c.get('image_path') or '/images/generations')
     last=None
     refs=[str(x).strip() for x in (reference_images or []) if str(x).strip()][:4]
@@ -186,18 +248,34 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
         for item in variants:
             v=dict(item); v.pop('quality',None); v.pop('style',None); clean.append(v)
         variants.extend(clean)
-    for attempt in range(c['retries']+1):
-        for variant in variants:
+    retryable_http=(408,409,429,500,502,503,504)
+    # Try payload aliases only when the provider rejects a shape. A transport
+    # failure must retry the same request after backoff; cycling every alias on
+    # a TLS EOF/reset creates a burst of duplicate generation requests.
+    for variant in variants:
+        shape_rejected=False
+        for attempt in range(c['retries']+1):
             try:
                 return _do_post_path(c,path,variant)
             except urllib.error.HTTPError as e:
                 body=e.read().decode('utf-8','ignore')
-                last=RuntimeError(f'图片接口 HTTP {e.code}: {body[:900]}')
-                if e.code not in (400,408,409,429,500,502,503,504): raise last
+                if e.code in (502,503,504):
+                    last=RuntimeError(f'生图网关暂时不可用（HTTP {e.code}），系统已自动重试；请稍后仅重试失败图片')
+                elif body.lstrip().lower().startswith(('<!doctype html','<html')):
+                    last=RuntimeError(f'图片接口 HTTP {e.code}：上游返回了网页错误页')
+                else:
+                    last=RuntimeError(f'图片接口 HTTP {e.code}: {body[:900]}')
+                if e.code==400:
+                    shape_rejected=True
+                    break
+                if e.code not in retryable_http:
+                    raise last
             except Exception as e:
                 last=RuntimeError(f'图片接口调用失败: {e}')
-        if attempt<c['retries']:
-            time.sleep(min(1.5*(attempt+1),4))
+            if attempt<c['retries']:
+                time.sleep(min(2 ** attempt * 2,8))
+        if not shape_rejected:
+            raise last or RuntimeError('图片接口调用失败')
     raise last or RuntimeError('图片接口调用失败')
 
 def _do_post_path(c,path,payload):

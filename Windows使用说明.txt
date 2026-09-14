@@ -1,0 +1,22 @@
+三笙AI 商品开品闭环 - Windows 便携版
+
+最终使用者不需要安装 Python、Node.js 或其他运行环境。
+
+使用方法
+1. 将整个压缩包解压到一个普通文件夹，不要直接在压缩包内运行。
+2. 双击 start-windows.bat。
+3. 浏览器会自动打开 http://127.0.0.1:17962/。
+4. 首次使用在配置页填写分析模型和生图模型的 API 信息并保存。
+5. 关闭软件时双击 stop-windows.bat。
+
+交付给别人时
+- 交付构建脚本生成的“三笙AI-商品开品闭环-Windows-最终安装包.zip”，不要交付源码目录或 Mac 版压缩包。
+- 解压后直接使用，不需要运行 pip、npm、python 或安装依赖。
+
+重要说明
+- 请保留压缩包内的全部文件，尤其是 SansongAI.exe 和 server 文件夹。
+- Windows 版后端已经内置运行时，不要求安装 Python。
+- 采集淘宝/天猫商品信息需要 Chrome 或其他支持 Chrome 扩展的 Chromium 浏览器。
+- 扩展安装方式：打开浏览器扩展管理页，开启“开发者模式”，选择“加载已解压的扩展程序”，分别选择 extension 或 collector-extension-standalone 文件夹。
+- 软件会在 server 文件夹内创建 config.json、reports、monitor_data 和 prompts.json，这些是用户数据，不要删除。
+- 如果 Windows Defender 弹出提示，请选择允许本地应用运行；程序只监听本机 127.0.0.1，不对外开放端口。

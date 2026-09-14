@@ -1,0 +1,167 @@
+三笙AI 商品开品闭环
+Windows EXE 打包交付说明
+
+请在 Windows 电脑上完成打包。Mac 电脑无法直接生成可用的 Windows EXE，这是正常情况。
+
+一、打包目标
+
+请把当前项目打包成 Windows 便携版。最终交付给使用者的是一个压缩包，解压后可以直接运行，不要求最终使用者安装 Python、Node.js 或其他开发环境。
+
+本项目不是只交付一个孤立的 SansongAI.exe。EXE 需要和它旁边的 server 文件夹、扩展文件夹、启动和停止脚本一起交付。请使用项目里现成的 PyInstaller one-directory 配置，不要改成单文件模式。
+
+二、打包前提
+
+1. 使用 Windows 10 或 Windows 11 电脑。
+2. 安装 64 位 Python 3.11 或更高版本，建议 Python 3.12/3.13。
+3. 安装时勾选 Add Python to PATH。
+4. 打包电脑可以访问项目文件夹，但不需要把 API Key 写进项目。
+5. 使用本说明所在项目根目录打包：
+
+   tmall-new-product-loop-v9.2.5-final
+
+不要使用旧的 Mac 压缩包、旧 dist 目录、release-final-20260911 目录或其他历史副本作为打包源。必须使用本项目当前根目录中的 server/server.py、server/ai_client.py、server/prompt_templates.py 和 server/report.js。
+
+三、准备项目
+
+把整个项目文件夹复制到 Windows，例如：
+
+   D:\build\tmall-new-product-loop-v9.2.5-final
+
+打开 PowerShell，进入项目根目录：
+
+   cd D:\build\tmall-new-product-loop-v9.2.5-final
+
+确认这些文件存在：
+
+   build-windows.ps1
+   start-windows.bat
+   stop-windows.bat
+   Windows使用说明.txt
+   server\server.spec
+   server\server.py
+   server\ai_client.py
+   server\prompt_templates.py
+   server\report.html
+   server\report.css
+   server\report.js
+   server\config.example.json
+
+四、执行打包
+
+在 PowerShell 中执行：
+
+   Set-ExecutionPolicy -Scope Process Bypass
+   .\build-windows.ps1
+
+如果系统没有 PyInstaller，脚本会自动执行安装。也可以手动先执行：
+
+   python -m pip install --upgrade pyinstaller
+   .\build-windows.ps1
+
+打包完成后，项目根目录应该出现：
+
+   三笙AI-商品开品闭环-Windows-最终安装包.zip
+
+同时会生成 windows-release 文件夹。请以 ZIP 压缩包作为最终交付物。
+
+五、最终压缩包必须包含
+
+   SansongAI.exe
+   server\
+   extension\
+   collector-extension-standalone\
+   start-windows.bat
+   stop-windows.bat
+   Windows使用说明.txt
+
+其中 server 文件夹不能删除或单独拿走。它包含报告页面、提示词、模型调用和配置模板。
+
+六、打包后的验收
+
+先把最终 ZIP 解压到普通文件夹，例如：
+
+   D:\SansongAI
+
+不要直接在 ZIP 压缩包内运行。双击：
+
+   start-windows.bat
+
+浏览器应自动打开：
+
+   http://127.0.0.1:17962/
+
+然后检查：
+
+1. 配置页可以填写分析模型 API 和生图模型 API。
+2. 可以保存配置，不需要手动创建 Python 环境。
+3. 浏览器扩展可以从 extension 或 collector-extension-standalone 文件夹加载。
+4. 生成图片弹窗中能看到“产品图（商品身份）”。
+5. 上传产品图后，能看到产品图预览。
+6. 同时存在上传产品图和采集商品参考图时，可以开启“产品展示状态跟随采集商品对应图片”。
+7. 开启后，上传产品图决定商品颜色、花型、材质、结构、轮廓和件数；采集参考图只决定视角、构图、动作、朝向、展开/折叠、摆放和部件关系。
+8. 生成记录中不能出现产品图和采集参考图职责反过来的情况。
+9. 关闭程序时双击 stop-windows.bat，SansongAI.exe 能被关闭。
+
+七、必须检查的版本证据
+
+用新版服务生成一组图片后，打开：
+
+   server\reports\generated_*.json
+
+在生成清单中检查：
+
+   "referenceRoleVersion": "20260911-reference-role-fix4"
+
+对于同时使用产品图和采集参考图的结果，检查每个结果至少包含：
+
+   "referenceBinding": "uploaded_identity_collected_slot"
+   "identityReferenceImageIndex": 1
+   "displayReferenceImageIndex": 2
+
+这三个字段的含义是：第 1 张输入图是用户上传的产品图，第 2 张输入图是当前槽位对应的采集参考图。若看到 identityReferenceImageIndex 为 2、displayReferenceImageIndex 为 1，说明运行的仍是旧后端，不能交付，必须停止旧进程后重新启动新版 EXE。
+
+八、交付给最终使用者的说明
+
+最终使用者只需要：
+
+1. 解压 ZIP。
+2. 双击 start-windows.bat。
+3. 在配置页填写 API 信息。
+4. 按说明安装浏览器扩展。
+5. 打开淘宝或天猫商品页进行采集。
+6. 在快速开品中上传产品图。
+7. 同时开启产品展示状态跟随采集商品对应图片。
+8. 重新生成主图和详情图。
+
+最终使用者不需要重新采集已有商品数据。刚生成的错误图片需要重新生成，不能自动修正。
+
+九、不要做的事情
+
+1. 不要把 API Key 写入 config.example.json。
+2. 不要把个人 server\config.json 一起打包给别人。
+3. 不要只发送 SansongAI.exe。
+4. 不要删除 EXE 旁边的 server 文件夹。
+5. 不要使用旧 dist 或历史 release 文件夹直接交付。
+6. 不要在旧 SansongAI.exe 仍运行时测试新版结果。
+7. 不要把“产品图”和“采集参考图”合并成一张图。
+
+十、打包失败时的排查
+
+如果双击 start-windows.bat 后没有打开页面：
+
+1. 检查 Windows Defender 是否拦截 SansongAI.exe。
+2. 检查 17962 端口是否被旧版本占用。
+3. 双击 stop-windows.bat 后，再双击 start-windows.bat。
+4. 确认 SansongAI.exe 和 server 文件夹在同一级目录。
+5. 确认 ZIP 已完整解压，而不是在压缩包内运行。
+6. 用 PowerShell 手动查看：
+
+   Invoke-WebRequest http://127.0.0.1:17962/health
+
+健康接口应返回 serverVersion、referenceRoleVersion 和 port 字段。
+
+打包人员完成后，请只回传：
+
+   三笙AI-商品开品闭环-Windows-最终安装包.zip
+
+并附上 Windows 验收结果，尤其是 identityReferenceImageIndex=1、displayReferenceImageIndex=2 的检查结果。

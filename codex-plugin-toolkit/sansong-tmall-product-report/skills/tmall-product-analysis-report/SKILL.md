@@ -41,6 +41,12 @@ description: Generate evidence-based, cross-category ecommerce product analysis 
 
 用户明确指定的商品字段可以覆盖对应报告默认值；未指定字段继续沿用报告基准。品牌、Logo、价格、销量、认证、专利、交易承诺、二维码、水印及其他平台禁区始终拦截。不要展示模型隐藏推理过程，也不要让单图编辑静默替换整套产品身份。
 
+### 参考图拍摄与产品展示状态一致开关
+
+请求字段 `matchReferenceShooting` 默认 `false`，控制拍摄语言和产品展示状态，不改变产品身份。勾选为 `true` 时，先分析第一张参考图的机位/视角、景别、主体占比、透视、构图/裁切、背景层级、光线、道具与留白，再具体识别商品的平铺/悬挂/折叠/展开/堆叠/铺设/穿着/手持/使用中状态、朝向、折叠程度、垂落褶皱、摆放落点、支撑/接触点、遮挡、部件关系，以及人物抓握/按压/提拉/铺开/穿戴的动作阶段并迁移到当前商品；不得复制参考图的品牌、文字、无关商品或未证实卖点。未勾选时，参考图只核对商品身份，拍摄与展示状态由当前槽位重新设计。
+
+优先级固定为：平台合规与安全 ＞ 用户明确商品设定和 `identityLock` ＞ 方案产品目标/允许的明确变化 ＞ 当前槽位业务目标与证据任务 ＞（勾选时）参考图拍摄语言 ＞ 默认构图风格。首张 `main:1` 以第一张参考图作商品外观母版；只允许产品目标或用户最终设定列出的字段改变，其他字段冻结。生成结果的 `referenceShootingPolicy` 为 `match_reference` 或 `identity_only`，预览和正式生成必须相同。
+
 ## 类目分支
 
 - 服饰：尺码、版型、面料、做工、色差、上身效果。
@@ -80,9 +86,11 @@ description: Generate evidence-based, cross-category ecommerce product analysis 
 
 ## 本地接口契约
 
-生成请求使用 `source` 或 `reportData`、`planIndex`、`assetTypes`、`selectedSlots`、`referenceImages`、`userDirection`、`promptOverrides`、`fissionPattern` 和 `completeSet`。先调用 `/api/image-prompt-preview` 检查槽位与最终提示词，再调用 `/api/generate-images`；不要在插件中绕过预览直接拼接提示词。参考图最多 4 张，上传后自动关闭裂变基准分支；没有任何可用商品主图或上传图时应明确报错。
+生成请求使用 `source` 或 `reportData`、`planIndex`、`assetTypes`、`selectedSlots`、`referenceImages`、`matchReferenceShooting`、`userDirection`、`promptOverrides`、`fissionPattern` 和 `completeSet`。先调用 `/api/image-prompt-preview` 检查槽位与最终提示词，再调用 `/api/generate-images`；不要在插件中绕过预览直接拼接提示词。参考图最多 4 张，上传后自动关闭裂变基准分支；没有任何可用商品主图或上传图时应明确报错。
 
 生图配置字段要和页面含义保持一致：`image_model` 是独立必填模型，`image_models_path`（默认 `/models`）用于模型列表探测，`image_path`（默认 `/images/generations`）用于实际 POST；`image_api_base`/`image_api_key` 未填写时逐字段继承分析渠道。每个槽位请求 `model`、`prompt`、`size`、`n=1`，参考图兼容字段按 `image`、`reference_images`、`images` 依次尝试；结果可为 URL 或 Base64，必须落盘并写入 job manifest。
+
+保持用户选择的槽位并发执行。TLS EOF 或连接重置只重试当前 payload 并指数退避，不能因传输错误轮换字段产生重复生图。单个独立槽位失败不得终止其余槽位：成功结果继续落盘，失败项写入 `failedSlots` 并设置 `partialFailure=true`，前端只重试失败槽位；全部失败或裂变基准图失败才将整批标记为 `error`。
 
 采集 JSON 经过 `scripts/normalize_capture.mjs` 后，必须保留 `meta.imageClassificationVersion`、`images.provenance/classification`、`collection.reviewCollectionComplete`、`product.parameterCollection`、`pageText` 和 `monitoring`。评论未确认完整时使用 `/api/analyze-current` 的部分分析入口；只有 `reviewCollectionComplete=true` 才使用 `/api/analyze`。
 

@@ -19,3 +19,5 @@ def test_version_consistency():
     assert f"SERVER_VERSION = '{EXPECTED}'" in ai
     start=(ROOT/'start-tmall-ai.command').read_text(encoding='utf-8')
     assert f'VERSION="{EXPECTED}"' in start
+    assert 'REFERENCE_ROLE_VERSION="20260911-reference-role-fix4"' in start
+    assert "referenceRoleVersion" in server

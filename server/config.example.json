@@ -5,6 +5,13 @@
   "image_api_base": "",
   "image_api_key": "",
   "image_model": "",
+  "image_models": [
+    {
+      "id": "gpt-image-2.5-flare",
+      "label": "GPT Image 2.5 Flare",
+      "quality": "medium"
+    }
+  ],
   "image_path": "/images/generations",
   "image_models_path": "/models",
   "image_size": "1024x1024",
@@ -14,6 +21,7 @@
   "temperature": 0.2,
   "timeout": 120,
   "retries": 2,
+  "image_concurrency": 5,
   "ssl_verify": true,
   "ca_bundle": "",
   "extra_headers": {}

@@ -219,7 +219,7 @@ class EvidenceOnlyReportTest(unittest.TestCase):
         doc = render(result, 'evidence-only')
         self.assertIn('window.REPORT_DATA=', doc)
         self.assertIn('Sansong Product Intelligence V9.3.0', doc)
-        self.assertIn('<script src="/report.js"></script>', doc)
+        self.assertIn('<script src="/report.js?v=', doc)
         self.assertNotIn('项目负责人', doc)
 
     def test_incomplete_final_editor_output_is_repaired_from_real_evidence(self):

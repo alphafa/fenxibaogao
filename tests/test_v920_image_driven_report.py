@@ -34,7 +34,7 @@ class V920ImageDrivenReportTest(unittest.TestCase):
     def test_renderer_is_image_driven_and_professional(self):
         doc=render(self.fixture(),'v920')
         self.assertIn('window.REPORT_DATA=',doc)
-        self.assertIn('<script src="/report.js"></script>',doc)
+        self.assertIn('<script src="/report.js?v=',doc)
         self.assertIn('IMG_MAIN_0001',doc)
         self.assertIn('IMG_DETAIL_0001',doc)
         self.assertNotIn('v92-main-grid',doc)

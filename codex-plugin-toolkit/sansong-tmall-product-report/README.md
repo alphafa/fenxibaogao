@@ -22,7 +22,9 @@
 
 ## 提示词与请求契约
 
-最终提示词按以下顺序组成：统一 `identityLock`（报告事实和用户 `productOverrides`）→ 参考图模式（`uploaded_reference`、`collected_reference`、`fission_base`、`fission_followup`）→ 全局用户方向 → 新品方案和爆款表达方法 → 当前槽位的 `assetType/index/role/task/handoff` → 页面参数、视觉和构图约束 → 平台禁区 → `image_generation` 模板中的 `{prompt}` → 相关性守卫后的 `promptMerge`。用户明确指定的材质、颜色、结构、件数、尺寸、规格、花型、款式或功能可以覆盖对应默认字段；品牌、交易、认证、二维码、水印等禁区始终拦截。
+最终提示词按以下顺序组成：统一 `identityLock`（报告事实和用户 `productOverrides`）→ 参考图模式（`uploaded_reference`、`collected_reference`、`fission_base`、`fission_followup`）→ 可选 `matchReferenceShooting` 拍摄语言策略 → 全局用户方向 → 新品方案和爆款表达方法 → 当前槽位的 `assetType/index/role/task/handoff` → 页面参数、视觉和构图约束 → 平台禁区 → `image_generation` 模板中的 `{prompt}` → 相关性守卫后的 `promptMerge`。用户明确指定的材质、颜色、结构、件数、尺寸、规格、花型、款式或功能可以覆盖对应默认字段；品牌、交易、认证、二维码、水印等禁区始终拦截。
+
+`matchReferenceShooting` 是视觉开关，不是产品换款开关：`true` 时同时锁定参考图的拍摄语言与产品展示状态。除机位、景别、透视、构图、背景、光线和留白外，还要具体复现平铺/悬挂/折叠/展开/堆叠/铺设/穿着/手持/使用中等状态，以及朝向、折叠程度、垂落褶皱、摆放落点、支撑/接触点、遮挡、部件关系和人物动作阶段；`identityLock`、方案产品目标和当前槽位业务目标仍为高优先级。`false` 时参考图只作商品身份/结构锚点，拍摄和展示状态由当前槽位重新设计。首张 `main:1` 优先以第一张参考图作为商品外观母版，多张图的其余图片只补充不可见面，不平均混合成新商品。提示词中同时写入中文和 English constraints，避免模型把参考图的品牌、文字、其他商品或未证实卖点带入。
 
 两个业务接口共用下列字段：
 
@@ -33,6 +35,7 @@
   "assetTypes": ["main", "detail"],
   "selectedSlots": ["main:1", "detail:3"],
   "referenceImages": ["data:image/png;base64,..."],
+  "matchReferenceShooting": false,
   "userDirection": "全局最终要求",
   "promptOverrides": {"detail:3": "本张相关编辑"},
   "fissionPattern": true,
@@ -40,7 +43,9 @@
 }
 ```
 
-`POST /api/image-prompt-preview` 返回 `slots`、`prompts`、`promptMerges`、`userDirectionBySlot` 和参考图状态；`POST /api/generate-images` 返回 `jobId`、`statusUrl`。状态包括 `queued`、`generating`、`complete`、`error`，完成结果包含每张图的 `assetType`、`slotIndex`、`prompt`、`identityLock`、本地 `url` 以及 `consistencyGate`。主图固定 `1024x1024`，详情图固定 `1024x1536`，每个槽位 `n=1`。
+`POST /api/image-prompt-preview` 返回 `slots`、`prompts`、`promptMerges`、`userDirectionBySlot`、`matchReferenceShooting`、`referenceShootingPolicy` 和参考图状态；`POST /api/generate-images` 返回 `jobId`、`statusUrl` 及同一策略字段。状态包括 `queued`、`generating`、`complete`、`error`，完成结果包含每张图的 `assetType`、`slotIndex`、`prompt`、`identityLock`、本地 `url` 以及 `consistencyGate`。主图固定 `1024x1024`，详情图固定 `1024x1536`，每个槽位 `n=1`。
+
+批量生图保持所选槽位并发执行；TLS EOF、连接重置等传输错误只对当前 payload 指数退避重试，不轮换参考图字段制造重复请求。独立槽位失败时保留其他成功图片，并在 `failedSlots`、`partialFailure` 中记录失败位置；页面自动切换为“仅重试失败”且不重复提交成功槽位。只有全部槽位失败或裂变基准图失败时，整批任务才进入 `error`。
 
 配置页把分析渠道和生图渠道分开显示：`image_model` 必填且独立于文本 `model`；`image_api_base`、`image_api_key` 为空时分别继承分析渠道对应字段。`image_models_path`（默认 `/models`）只用于保存/测试时查模型列表，真正出图使用 `image_path`（默认 `/images/generations`）。请求体会发送 `model`、`prompt`、`size`、`n`，并按供应商兼容形态尝试 `image`、`reference_images` 或 `images`；返回的 URL/Base64 会在本地落盘，页面不会显示任何 Key。
 

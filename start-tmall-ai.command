@@ -2,17 +2,18 @@
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 PORT=17962
 VERSION="9.3.0"
+REFERENCE_ROLE_VERSION="20260911-reference-role-fix4"
 SERVER="$ROOT/server"
 LOG="$SERVER/v9_1_0.log"
 
 health_identity() {
   curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | python3 -c 'import sys,json
 try:
- d=json.load(sys.stdin); print(d.get("serverVersion","")+"|"+d.get("configPath",""))
+ d=json.load(sys.stdin); print(d.get("serverVersion","")+"|"+d.get("configPath","")+"|"+d.get("referenceRoleVersion",""))
 except: print("")' 2>/dev/null
 }
 
-EXPECTED="$VERSION|$SERVER/config.json"
+EXPECTED="$VERSION|$SERVER/config.json|$REFERENCE_ROLE_VERSION"
 RUNNING="$(health_identity || true)"
 if [ "$RUNNING" = "$EXPECTED" ]; then
   open "http://127.0.0.1:$PORT/"

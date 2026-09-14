@@ -1,8 +1,12 @@
 import base64
 import json
+import ssl
 import sys
 import tempfile
 import unittest
+import urllib.error
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,6 +95,66 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertEqual('image-key', channel['api_key'])
         self.assertEqual('/image-models', channel['models_path'])
 
+    def test_image_quality_is_sent_per_request(self):
+        import ai_client
+        config = {
+            'api_base': 'https://image.example/v1', 'api_key': 'image-key',
+            'image_model': 'gpt-image-2.5-flare', 'image_path': '/images/generations',
+            'image_quality': 'low', 'timeout': 120, 'retries': 0, '_config_error': '',
+        }
+        response = {'data': [{'b64_json': 'unused'}]}
+        with patch.object(ai_client, 'image_channel', return_value=config), \
+             patch.object(ai_client, '_do_post_path', return_value=response) as post:
+            actual = ai_client.image_generate('test', quality='high')
+        self.assertEqual(response, actual)
+        self.assertEqual('high', post.call_args.args[2]['quality'])
+
+    def test_comparison_models_keep_independent_quality(self):
+        report = sample_report()
+        job_id = 'img_test_model_quality_comparison'
+        calls = []
+
+        def fake_generate(prompt, **kwargs):
+            calls.append(kwargs)
+            return {'data': [{'b64_json': 'unused'}]}
+
+        config = {
+            'api_key': 'image-key', 'model': 'text-model', 'image_model': 'flare',
+            'image_models': [
+                {'id': 'flare', 'label': 'Flare'},
+                {'id': 'sunburst', 'label': 'Sunburst'},
+            ],
+            '_config_error': '',
+        }
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'load_config', return_value=config), \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', side_effect=lambda *args, **kwargs: {
+                 'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main'], 'completeSet': True,
+                'selectedSlots': ['main:1'], 'fissionPattern': False,
+                'referenceImages': ['data:image/png;base64,AAAA'],
+                'imageModels': [
+                    {'id': 'flare', 'quality': 'medium'},
+                    {'id': 'sunburst', 'quality': 'high'},
+                ],
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+
+        self.assertEqual('complete', state['status'])
+        self.assertEqual(['high', 'medium'], sorted(item.get('quality') for item in calls))
+        self.assertEqual({'flare': 'medium', 'sunburst': 'high'}, {
+            item['model']: item['quality'] for item in state['results']
+        })
+        self.assertEqual(['medium', 'high'], [item['quality'] for item in state['comparisonModels']])
+
     def test_report_requires_count_confirmation_before_generation(self):
         script = (ROOT / 'server' / 'report.js').read_text('utf-8')
         self.assertIn('确认生成：${countText(counts)}', script)
@@ -107,6 +171,10 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('job.planName', script)
         self.assertIn("brand.innerHTML='<b>三笙AI</b>", script)
         self.assertIn('统一收录在底部完整分析区', script)
+        self.assertIn('本次生成参数', script)
+        self.assertIn('请求质量', script)
+        self.assertIn('generation-task-result-meta', script)
+        self.assertIn('质量：${modelQuality(item)}', script)
 
     def test_engineering_validation_has_chinese_display_dictionary(self):
         script = (ROOT / 'server' / 'report.js').read_text('utf-8')
@@ -118,7 +186,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         ):
             self.assertIn(mapping, script)
         self.assertIn('esc(displayValue(title))', script)
-        self.assertIn('打造这款产品', script)
+        self.assertIn('按此方向开品', script)
         self.assertIn('data-reference-input', script)
         self.assertIn('referenceImages:uploadedReferences', script)
         self.assertIn('商品主图参考', script)
@@ -275,8 +343,9 @@ class ImageGenerationFlowTest(unittest.TestCase):
             self.assertTrue(any(x['assetType'] == 'main' for x in slots))
             self.assertTrue(any(x['assetType'] == 'detail' for x in slots))
             prompt = app.build_image_prompt(completed, plan, slots[0]['assetType'], 0, slots[0])
-            self.assertIn('产品新方案：'+plan['name'], prompt)
-            self.assertIn('方案副标题：'+plan['sourceType'], prompt)
+            self.assertNotIn(plan['name'], prompt)
+            self.assertNotIn(plan['sourceType'], prompt)
+            self.assertIn('产品与页面执行约束：', prompt)
             self.assertIn('产品必须落实：', prompt)
             self.assertIn('整套图片必须落实：', prompt)
 
@@ -312,14 +381,405 @@ class ImageGenerationFlowTest(unittest.TestCase):
 
     def test_reference_prompt_mode_is_identical_for_preview_and_execution(self):
         self.assertEqual('uploaded_reference', app.image_reference_mode('uploaded', True, {'assetType': 'main', 'index': 1}))
+        self.assertEqual('uploaded_identity_collected_reference', app.image_reference_mode(
+            'uploaded', False, {'assetType': 'main', 'index': 1}, True,
+        ))
         self.assertEqual('collected_reference', app.image_reference_mode('first_main', False, {'assetType': 'main', 'index': 1}))
         self.assertEqual('fission_base', app.image_reference_mode('first_main', True, {'assetType': 'main', 'index': 1}))
         self.assertEqual('fission_followup', app.image_reference_mode('first_main', True, {'assetType': 'detail', 'index': 1}))
+
+    def test_reference_shooting_toggle_has_strict_boolean_defaults_and_aliases(self):
+        self.assertFalse(app._match_reference_shooting({}, False))
+        self.assertTrue(app._match_reference_shooting({'matchReferenceShooting': True}, False))
+        self.assertFalse(app._match_reference_shooting({'matchReferenceShooting': 'false'}, True))
+        self.assertTrue(app._match_reference_shooting({'referenceShootingMatch': 'on'}, False))
+        self.assertFalse(app._match_reference_shooting({'reference_shooting_match': 'off'}, True))
+        # Unknown values must fall back to the explicit default rather than
+        # treating every non-empty form string as true.
+        self.assertFalse(app._match_reference_shooting({'matchReferenceShooting': 'off-ish'}, False))
+
+    def test_reference_shooting_toggle_changes_prompt_without_changing_product_goal(self):
+        report = sample_report()
+        plan = report['experienceSolution']['newProductPlans']['plans'][0]
+        slot = app.build_generation_slots(report, plan)[0]
+        disabled = app.build_image_prompt(
+            report, plan, 'main', 0, slot,
+            product_reference_mode='uploaded_reference',
+            match_reference_shooting=False,
+        )
+        enabled = app.build_image_prompt(
+            report, plan, 'main', 0, slot,
+            product_reference_mode='uploaded_reference',
+            match_reference_shooting=True,
+        )
+        self.assertIn('matchReferenceShooting=false', disabled)
+        self.assertIn('不继承参考图的拍摄语言或产品展示状态', disabled)
+        self.assertIn('不要复制其机位、景别', disabled)
+        self.assertIn('matchReferenceShooting=true', enabled)
+        self.assertIn('拍摄语言必须尽量一致：机位与视角', enabled)
+        self.assertIn('产品展示状态必须具体复现', enabled)
+        self.assertIn('动作状态必须具体复现', enabled)
+        self.assertIn('支撑点、遮挡关系、部件相对位置', enabled)
+        self.assertIn('action direction and action phase', enabled)
+        self.assertIn('业务目标（不可丢失）', enabled)
+        self.assertIn('产品目标（不可丢失）', enabled)
+        self.assertNotIn('规格透明款', enabled)
+        self.assertIn('保持用户最终确认的商品品类', enabled)
+        enabled_benchmark = enabled[enabled.index('爆款商品特征借鉴') : enabled.index('本套图中的第')]
+        self.assertIn('只借鉴高转化的信息层级、证明顺序、文字层次和转化逻辑', enabled_benchmark)
+        self.assertNotIn('借鉴爆款主图/详情图的高转化结构、主体占比、场景钩子', enabled_benchmark)
+        self.assertIn('以参考图拍摄语言为主', enabled)
+        self.assertIn('最小适配', enabled)
+        # With the switch off, the normal ecommerce composition remains the
+        # source of truth instead of inheriting the reference shoot.
+        self.assertIn('商品主体占画面60-80%', disabled)
+        self.assertNotEqual(disabled, enabled)
+
+    def test_reference_shooting_prompt_freezes_first_main_product_and_is_bilingual(self):
+        report = sample_report()
+        plan = report['experienceSolution']['newProductPlans']['plans'][0]
+        slots = [item for item in app.build_generation_slots(report, plan) if item['assetType'] == 'main']
+        first = app.build_image_prompt(
+            report, plan, 'main', 0, slots[0],
+            product_reference_mode='uploaded_reference',
+            match_reference_shooting=True,
+        )
+        second = app.build_image_prompt(
+            report, plan, 'main', 1, slots[1],
+            product_reference_mode='uploaded_reference',
+            match_reference_shooting=True,
+        )
+        # main:1 is the product master; later slots inherit the same identity
+        # but must not be labelled as the first-image master.
+        self.assertIn('首张主图（main:1）', first)
+        self.assertIn('第一张参考图作为商品外观母版', first)
+        self.assertIn('只有“产品目标”或用户最终设定明确列出的字段可以改变', first)
+        self.assertIn('当前槽位继续继承同一产品身份', second)
+        self.assertNotIn('首张主图（main:1）', second)
+        self.assertIn('【English constraints】Match both the reference shooting grammar', first)
+        self.assertIn('Preserve the current product silhouette', first)
+        # Business/product goals must be stated before the lower-priority
+        # shooting language so a provider cannot trade conversion intent for
+        # visual imitation.
+        self.assertLess(first.index('产品目标（不可丢失）'), first.index('拍摄语言必须尽量一致：机位与视角'))
+
+    def test_reference_shooting_toggle_is_persisted_on_worker_and_each_result(self):
+        report = sample_report()
+        job_id = 'img_test_reference_shooting_toggle'
+        prompts = []
+
+        def fake_generate(prompt, **kwargs):
+            prompts.append(prompt)
+            return {'data': [{'b64_json': 'unused'}]}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', side_effect=lambda *args, **kwargs: {
+                 'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main'], 'completeSet': True,
+                'selectedSlots': ['main:1'], 'fissionPattern': False,
+                'referenceImages': ['data:image/png;base64,AAAA'],
+                'matchReferenceShooting': True,
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+            self.assertEqual('complete', state['status'])
+            self.assertTrue(state['matchReferenceShooting'])
+            self.assertEqual('match_reference', state['referenceShootingPolicy'])
+            self.assertTrue(state['results'][0]['matchReferenceShooting'])
+            self.assertIn('matchReferenceShooting=true', prompts[0])
+            manifest = json.loads((app.REPORTS / f'generated_{job_id}.json').read_text('utf-8'))
+            self.assertTrue(manifest['matchReferenceShooting'])
+            self.assertEqual('match_reference', manifest['referenceShootingPolicy'])
+
+    def test_match_reference_shooting_binds_collected_image_to_each_slot(self):
+        """Matching mode must use the corresponding source image, not one shared first image."""
+        report = sample_report()
+        report['facts']['images'] = {'main': [
+            'https://example.test/main-1.jpg',
+            'https://example.test/main-2.jpg',
+        ]}
+        report['evidenceLedger'] = [
+            {'id': 'IMG_MAIN_0001', 'type': 'image', 'value': 'https://example.test/main-1.jpg',
+             'meta': {'group': 'main'}},
+            {'id': 'IMG_MAIN_0002', 'type': 'image', 'value': 'https://example.test/main-2.jpg',
+             'meta': {'group': 'main'}},
+        ]
+        job_id = 'img_test_slot_reference_binding'
+        calls = []
+
+        def fake_generate(prompt, **kwargs):
+            calls.append((prompt, list(kwargs.get('reference_images') or [])))
+            return {'data': [{'b64_json': 'unused'}]}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', side_effect=lambda *args, **kwargs: {
+                 'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main'], 'completeSet': True,
+                'selectedSlots': ['main:1', 'main:2'], 'fissionPattern': True,
+                'matchReferenceShooting': True,
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+
+        self.assertEqual('complete', state['status'])
+        self.assertFalse(state['fissionPattern'])
+        first = next(item for item in calls if '第1版main' in item[0])
+        second = next(item for item in calls if '第2版main' in item[0])
+        self.assertEqual(['https://example.test/main-1.jpg'], first[1])
+        self.assertEqual(['https://example.test/main-2.jpg'], second[1])
+        self.assertIn('当前槽位参考图绑定', first[0])
+        self.assertIn('IMG_MAIN_0001', first[0])
+        self.assertIn('IMG_MAIN_0002', second[0])
+        main2 = next(item for item in state['results'] if item['slotIndex'] == 2)
+        self.assertEqual('slot_evidence_reference', main2['referenceBinding'])
+        self.assertEqual('IMG_MAIN_0002', main2['referenceEvidenceId'])
+
+    def test_uploaded_identity_does_not_override_collected_slot_display_state(self):
+        """Uploaded product identity and collected slot presentation must be separate inputs."""
+        report = sample_report()
+        report['facts']['images'] = {
+            'main': ['https://example.test/collected-main-1.jpg', 'https://example.test/collected-main-2.jpg'],
+            'detail': ['https://example.test/collected-detail-1.jpg'],
+        }
+        report['evidenceLedger'] = [
+            {'id': 'IMG_MAIN_0001', 'type': 'image', 'value': 'https://example.test/collected-main-1.jpg',
+             'meta': {'group': 'main'}},
+            {'id': 'IMG_MAIN_0002', 'type': 'image', 'value': 'https://example.test/collected-main-2.jpg',
+             'meta': {'group': 'main'}},
+            {'id': 'IMG_DETAIL_0001', 'type': 'image', 'value': 'https://example.test/collected-detail-1.jpg',
+             'meta': {'group': 'detail'}},
+        ]
+        job_id = 'img_test_hybrid_reference_roles'
+        calls = []
+
+        def fake_generate(prompt, **kwargs):
+            calls.append((prompt, list(kwargs.get('reference_images') or [])))
+            return {'data': [{'b64_json': 'unused'}]}
+
+        uploaded = 'data:image/png;base64,UPLOADED_PRODUCT'
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', side_effect=lambda *args, **kwargs: {
+                 'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main', 'detail'], 'completeSet': True,
+                'selectedSlots': ['main:1', 'main:2', 'detail:1'], 'fissionPattern': True,
+                'referenceImages': [uploaded], 'matchReferenceShooting': True,
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+
+        self.assertEqual('complete', state['status'])
+        self.assertFalse(state['fissionPattern'])
+        main1 = next(item for item in calls if '第1版main' in item[0])
+        main2 = next(item for item in calls if '第2版main' in item[0])
+        detail1 = next(item for item in calls if '第1版detail' in item[0])
+        # Every slot receives the uploaded identity master first and its own
+        # collected display-state master second.
+        self.assertEqual([uploaded, 'https://example.test/collected-main-1.jpg'], main1[1])
+        self.assertEqual([uploaded, 'https://example.test/collected-main-2.jpg'], main2[1])
+        self.assertEqual([uploaded, 'https://example.test/collected-detail-1.jpg'], detail1[1])
+        for prompt, _ in (main1, main2, detail1):
+            self.assertIn('双参考输入顺序', prompt)
+            self.assertIn('第1张输入图是用户上传产品图', prompt)
+            self.assertIn('第2张输入图是采集商品当前槽位图', prompt)
+            self.assertIn('第2张图中的商品外观、颜色、花型、材质和结构不得覆盖第1张产品图', prompt)
+            self.assertIn('严禁让产品图决定本图视角', prompt)
+        main2_result = next(item for item in state['results'] if item['assetType'] == 'main' and item['slotIndex'] == 2)
+        self.assertEqual('uploaded_identity_collected_slot', main2_result['referenceBinding'])
+        self.assertEqual('uploaded_identity_collected_display', main2_result['referenceRole'])
+        self.assertEqual('IMG_MAIN_0002', main2_result['referenceEvidenceId'])
+        self.assertEqual(1, main2_result['identityReferenceImageIndex'])
+        self.assertEqual(2, main2_result['displayReferenceImageIndex'])
+        self.assertEqual(1, main2_result['referenceImageIndex'])
+        self.assertEqual(2, main2_result['referenceCountUsed'])
+
+    def test_first_main_uses_only_primary_reference_while_followup_can_use_supporting_refs(self):
+        """Do not let the provider average several products into main:1."""
+        report = sample_report()
+        job_id = 'img_test_primary_reference_routing'
+        calls = []
+
+        def fake_generate(prompt, **kwargs):
+            calls.append((prompt, list(kwargs.get('reference_images') or [])))
+            return {'data': [{'b64_json': 'unused'}]}
+
+        references = [
+            'data:image/png;base64,PRIMARY',
+            'data:image/png;base64,SUPPORTING',
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', side_effect=lambda *args, **kwargs: {
+                 'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main', 'detail'], 'completeSet': True,
+                'selectedSlots': ['main:1', 'detail:1'], 'fissionPattern': False,
+                'referenceImages': references,
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+
+        self.assertEqual('complete', state['status'])
+        main_call = next(item for item in calls if '第1版main' in item[0])
+        detail_call = next(item for item in calls if '第1版detail' in item[0])
+        self.assertEqual([references[0]], main_call[1])
+        self.assertEqual(references, detail_call[1])
+        main_result = next(item for item in state['results'] if item['assetType'] == 'main')
+        self.assertEqual('primary_product_master', main_result['referenceRole'])
+        self.assertEqual(1, main_result['referenceCount'])
+        self.assertEqual(1, main_result['referenceCountUsed'])
+
+    def test_image_transport_error_retries_same_payload_before_alias_fallback(self):
+        import ai_client
+        config = {
+            'api_base': 'https://image.example/v1', 'api_key': 'image-key',
+            'image_model': 'image-model', 'image_path': '/images/generations',
+            'timeout': 120, 'retries': 2, '_config_error': '',
+        }
+        response = {'data': [{'b64_json': 'unused'}]}
+        with patch.object(ai_client, 'image_channel', return_value=config), \
+             patch.object(ai_client, '_do_post_path', side_effect=[ssl.SSLEOFError(8, 'EOF'), response]) as post, \
+             patch.object(ai_client.time, 'sleep') as sleep:
+            actual = ai_client.image_generate(
+                'test', reference_images=['data:image/png;base64,AAAA'],
+            )
+        self.assertEqual(response, actual)
+        self.assertEqual(2, post.call_count)
+        self.assertEqual(post.call_args_list[0].args[2], post.call_args_list[1].args[2])
+        sleep.assert_called_once_with(2)
+
+    def test_persistent_transport_error_does_not_cycle_payload_aliases(self):
+        import ai_client
+        config = {
+            'api_base': 'https://image.example/v1', 'api_key': 'image-key',
+            'image_model': 'image-model', 'image_path': '/images/generations',
+            'timeout': 120, 'retries': 2, '_config_error': '',
+        }
+        with patch.object(ai_client, 'image_channel', return_value=config), \
+             patch.object(ai_client, '_do_post_path', side_effect=ssl.SSLEOFError(8, 'EOF')) as post, \
+             patch.object(ai_client.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, '图片接口调用失败'):
+                ai_client.image_generate(
+                    'test', reference_images=['data:image/png;base64,AAAA'],
+                )
+        self.assertEqual(3, post.call_count)
+        self.assertEqual([2, 4], [call.args[0] for call in sleep.call_args_list])
+
+    def test_gateway_html_error_is_sanitized_for_users(self):
+        import ai_client
+        config = {
+            'api_base': 'https://image.example/v1', 'api_key': 'image-key',
+            'image_model': 'image-model', 'image_path': '/images/generations',
+            'timeout': 120, 'retries': 0, '_config_error': '',
+        }
+        error = urllib.error.HTTPError(
+            'https://image.example/v1/images/generations', 502, 'Bad Gateway', {},
+            BytesIO(b'<html><body><h1>502 Bad Gateway</h1></body></html>'),
+        )
+        with patch.object(ai_client, 'image_channel', return_value=config), \
+             patch.object(ai_client, '_do_post_path', side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, '生图网关暂时不可用') as caught:
+                ai_client.image_generate('test')
+        self.assertNotIn('<html>', str(caught.exception))
+
+    def test_worker_keeps_successful_images_when_one_independent_slot_fails(self):
+        report = sample_report()
+        job_id = 'img_test_partial_failure'
+
+        def fake_generate(prompt, **kwargs):
+            if '第1版main' in prompt:
+                raise RuntimeError('temporary TLS EOF')
+            return {'data': [{'b64_json': 'unused'}]}
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
+             patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'image_generate', side_effect=fake_generate), \
+             patch.object(app, '_save_generated_item', return_value={
+                 'url': '/reports/assets/generated/test/02.png', '_path': '/tmp/02.png',
+             }):
+            app.GENERATED_ASSET_ROOT.mkdir(parents=True)
+            app.REPORTS.mkdir(parents=True)
+            app.IMAGE_JOBS[job_id] = {'status': 'queued', 'progress': 5, 'results': []}
+            app._generation_worker(job_id, report, {
+                'planIndex': 0, 'assetTypes': ['main'], 'completeSet': True,
+                'selectedSlots': ['main:1', 'main:2'], 'fissionPattern': False,
+                'referenceImages': ['data:image/png;base64,AAAA'],
+            })
+            state = app.IMAGE_JOBS.pop(job_id)
+
+        self.assertEqual('complete', state['status'])
+        self.assertTrue(state['partialFailure'])
+        self.assertEqual(1, len(state['results']))
+        self.assertEqual(1, len(state['failedSlots']))
+        self.assertEqual(('main', 1), (
+            state['failedSlots'][0]['assetType'], state['failedSlots'][0]['slotIndex'],
+        ))
+        self.assertIn('temporary TLS EOF', state['failedSlots'][0]['error'])
 
     def test_reference_changes_refresh_the_visible_prompt_preview(self):
         script = (ROOT / 'server' / 'report.js').read_text('utf-8')
         self.assertIn("error.message||'参考图提示词刷新失败'", script)
         self.assertIn("error.message||'裂变提示词刷新失败'", script)
+
+    def test_report_explains_html_returned_by_json_api(self):
+        script = (ROOT / 'server' / 'report.js').read_text('utf-8')
+        self.assertIn('async function readJsonResponse', script)
+        self.assertIn("returnedHtml?'返回了网页内容':'返回内容不是有效 JSON'", script)
+        self.assertIn("readJsonResponse(response,'/api/image-prompt-preview')", script)
+        self.assertIn("readJsonResponse(response,'/api/generate-images')", script)
+
+    def test_reference_shooting_match_toggle_reaches_preview_and_generation(self):
+        script = (ROOT / 'server' / 'report.js').read_text('utf-8')
+        # The checkbox is deliberately opt-in: product identity remains locked
+        # by default, while camera treatment follows each image task unless the
+        # user asks to match the reference shoot.
+        self.assertIn('data-match-reference-shooting', script)
+        self.assertIn('data-match-reference-wrap', script)
+        self.assertIn('产品展示与参考图拍摄一致', script)
+        self.assertIn("matchReferenceLabel.textContent='产品展示状态跟随采集商品对应图片'", script)
+        self.assertIn('matchReferenceShooting=()=>!!matchReferenceInput?.checked', script)
+        self.assertIn('!matchReferenceShooting()', script)
+        self.assertIn('matchReferenceShooting:matchReferenceShooting()', script)
+        self.assertIn('视角、动作、朝向、展开/折叠、摆放、支撑和部件关系跟随采集商品对应图片', script)
+        self.assertGreaterEqual(script.count('matchReferenceShooting:matchReferenceShooting()'), 4)
+        self.assertIn("state.matchReferenceShooting?'已按参考图拍摄与产品展示状态生成。'", script)
+        self.assertIn("job.matchReferenceShooting?'已按参考图拍摄与展示状态一致'", script)
+
+    def test_partial_failure_ui_retries_only_failed_slots_and_keeps_successes(self):
+        script = (ROOT / 'server' / 'report.js').read_text('utf-8')
+        self.assertIn('retainedResults=[], generatedTaskSlots=[]', script)
+        self.assertIn('const displayResults=mergeResults(retainedResults,state.results)', script)
+        self.assertIn('orderedResults(job.results)', script)
+        self.assertIn('selectedSlotKeys=new Set(failedSlots.map', script)
+        self.assertIn('仅重试失败：${countText(counts)}', script)
+        self.assertIn('点击按钮仅重试失败槽位', script)
+        self.assertIn('部分完成 · 失败 ${failedCount} 张', script)
 
     def test_worker_generates_every_slot_and_persists_manifest(self):
         report = sample_report()
@@ -431,7 +891,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
             self.assertIn('每张图用户编辑提示词', prompts[0])
             self.assertIn('主图构图改为更清爽', prompts[0])
             self.assertIn('内置关联提示词', prompts[0])
-            self.assertIn('产品新方案：规格透明款', prompts[0])
+            self.assertNotIn('规格透明款', prompts[0])
             self.assertIn('不可覆盖约束', prompts[0])
 
     def test_unrelated_per_slot_prompt_override_does_not_replace_plan(self):
@@ -442,8 +902,69 @@ class ImageGenerationFlowTest(unittest.TestCase):
         prompt, meta = app.merge_image_prompt_with_user_edit(base, '客服话术改成周末发短信提醒', slot, {'accepted': []})
         self.assertEqual('ignored_unrelated', meta['mode'])
         self.assertIn('单图用户编辑未采纳', prompt)
-        self.assertIn('产品新方案：规格透明款', prompt)
+        self.assertNotIn('规格透明款', prompt)
         self.assertNotIn('每张图用户编辑提示词', prompt)
+
+    def test_plan_label_never_enters_image_prompt_even_when_repeated_in_actions(self):
+        report = sample_report()
+        plan = report['experienceSolution']['newProductPlans']['plans'][0]
+        plan.update({
+            'name': '规格校准款',
+            'sourceType': '反馈驱动升级',
+            'whyThisPlan': '规格校准款先解决选错问题',
+            'productAction': '规格校准款统一材质和件数',
+            'pageAction': '规格校准款主图讲清规格，详情逐项证明',
+        })
+        slot = app.build_generation_slots(report, plan)[0]
+        prompt = app.build_image_prompt(report, plan, slot['assetType'], 0, slot)
+        self.assertNotIn('规格校准款', prompt)
+        self.assertNotIn('反馈驱动升级', prompt)
+        self.assertIn('统一材质和件数', prompt)
+        self.assertIn('主图讲清规格', prompt)
+        self.assertIn('详情逐项证明', prompt)
+
+    def test_image_job_archive_contains_images_and_portable_manifest(self):
+        job_id = 'img_test_download'
+        with tempfile.TemporaryDirectory() as tmp:
+            generated_root = Path(tmp) / 'assets'
+            reports_root = Path(tmp) / 'reports'
+            job_root = generated_root / job_id
+            job_root.mkdir(parents=True)
+            reports_root.mkdir(parents=True)
+            image_path = job_root / '01.png'
+            image_path.write_bytes(b'\x89PNG\r\n\x1a\nfake')
+            state = {
+                'jobId': job_id,
+                'status': 'complete',
+                'results': [{
+                    'url': f'/reports/assets/generated/{job_id}/01.png',
+                    '_path': str(image_path),
+                    'assetType': 'main',
+                    'slotIndex': 1,
+                }],
+            }
+            with patch.object(app, 'GENERATED_ASSET_ROOT', generated_root), \
+                 patch.object(app, 'REPORTS', reports_root), \
+                 patch.object(app, 'IMAGE_JOBS', {job_id: state}):
+                archive = app._image_job_archive(job_id)
+            with zipfile.ZipFile(BytesIO(archive)) as bundle:
+                self.assertEqual({'images/main-01.png', 'manifest.json'}, set(bundle.namelist()))
+                manifest = json.loads(bundle.read('manifest.json').decode('utf-8'))
+                self.assertEqual('images/main-01.png', manifest['results'][0]['downloadFile'])
+                self.assertNotIn('_path', manifest['results'][0])
+                self.assertEqual(b'\x89PNG\r\n\x1a\nfake', bundle.read('images/main-01.png'))
+
+    def test_report_exposes_floating_history_and_task_download(self):
+        script = (ROOT / 'server' / 'report.js').read_text('utf-8')
+        css = (ROOT / 'server' / 'report.css').read_text('utf-8')
+        self.assertIn('data-generation-history-open', script)
+        self.assertIn('data-generation-history-dialog', script)
+        self.assertIn('/api/image-job/${encodeURIComponent(job.jobId)}/download', script)
+        self.assertIn('generation-history-fab', css)
+        self.assertIn('#quick-plan-dialog,\n.generation-history-dialog,\n.image-preview-dialog', css)
+        self.assertIn('border-radius:24px!important', css)
+        self.assertIn('#quick-plan-dialog .dialog-close,\n.generation-history-dialog .dialog-close', css)
+        self.assertIn('border-radius:12px!important', css)
 
 
 if __name__ == '__main__':
