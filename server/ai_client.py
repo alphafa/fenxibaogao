@@ -1,4 +1,5 @@
-import json, os, re, ssl, time, urllib.request, urllib.error
+import base64, json, os, re, ssl, time, uuid, urllib.request, urllib.error
+from urllib.parse import urlparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -233,9 +234,18 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
     if style_value: payload['style']=style_value
     path=str(c.get('image_path') or '/images/generations')
     last=None
-    refs=[str(x).strip() for x in (reference_images or []) if str(x).strip()][:4]
+    refs=[str(x).strip() for x in (reference_images or []) if str(x).strip()]
+    if len(refs)>4:
+        raise ValueError('单次生图最多四张参考图，不能静默丢弃输入')
+    edit_request=bool(refs and image_model.startswith('gpt-image-') and (
+        urlparse(c['api_base']).hostname in ('api.apiyi.com','api.openai.com') or path.rstrip('/').endswith('/images/edits')
+    ))
+    if edit_request and path.rstrip('/').endswith('/images/generations'):
+        path=path.rstrip('/')[:-len('generations')]+'edits'
     variants=[]
-    if refs:
+    if edit_request:
+        variants=[payload]
+    elif refs:
         # OpenAI-compatible image gateways use different names for image guidance.
         # Try the common JSON shapes, but never silently drop a requested reference.
         for key in ('image','reference_images','images'):
@@ -243,7 +253,7 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
     else:
         variants=[payload]
     # Gateways differ: retry without optional fields before failing the job.
-    if 'quality' in payload or 'style' in payload:
+    if not edit_request and ('quality' in payload or 'style' in payload):
         clean=[]
         for item in variants:
             v=dict(item); v.pop('quality',None); v.pop('style',None); clean.append(v)
@@ -256,7 +266,7 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
         shape_rejected=False
         for attempt in range(c['retries']+1):
             try:
-                return _do_post_path(c,path,variant)
+                return _do_image_edit(c,path,variant,refs) if edit_request else _do_post_path(c,path,variant)
             except urllib.error.HTTPError as e:
                 body=e.read().decode('utf-8','ignore')
                 if e.code in (502,503,504):
@@ -266,6 +276,8 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
                 else:
                     last=RuntimeError(f'图片接口 HTTP {e.code}: {body[:900]}')
                 if e.code==400:
+                    if edit_request:
+                        raise last
                     shape_rejected=True
                     break
                 if e.code not in retryable_http:
@@ -277,6 +289,34 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
         if not shape_rejected:
             raise last or RuntimeError('图片接口调用失败')
     raise last or RuntimeError('图片接口调用失败')
+
+def _do_image_edit(c,path,payload,refs):
+    """Send ordered, actual image files using the provider's edit contract."""
+    boundary='tmall_image_'+uuid.uuid4().hex
+    chunks=[]
+    for key,value in payload.items():
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n').encode('utf-8'))
+    for index,ref in enumerate(refs,1):
+        if not ref.startswith('data:image/') or ',' not in ref:
+            raise ValueError('编辑接口必须接收已读取的图片数据，不能传远程链接')
+        head,encoded=ref.split(',',1)
+        if ';base64' not in head:
+            raise ValueError('参考图必须使用 Base64 图片数据')
+        data=base64.b64decode(encoded,validate=True)
+        mime=head[5:].split(';',1)[0].lower()
+        formats={'image/png':('png',data.startswith(b'\x89PNG\r\n\x1a\n')),
+                 'image/jpeg':('jpg',data.startswith(b'\xff\xd8\xff')),
+                 'image/webp':('webp',data[:4]==b'RIFF' and data[8:12]==b'WEBP')}
+        if mime not in formats or not formats[mime][1] or len(data)>16*1024*1024:
+            raise ValueError('参考图类型、数据签名或大小不符合编辑接口要求')
+        ext=formats[mime][0]
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="reference-{index}.{ext}"\r\nContent-Type: {mime}\r\n\r\n').encode('ascii'))
+        chunks.extend((data,b'\r\n'))
+    chunks.append(f'--{boundary}--\r\n'.encode('ascii'))
+    headers=_headers(c);headers['Content-Type']='multipart/form-data; boundary='+boundary
+    req=urllib.request.Request(_join(c['api_base'],path),data=b''.join(chunks),headers=headers,method='POST')
+    with urllib.request.urlopen(req,timeout=c['timeout'],context=_ssl_context(c)) as response:
+        return json.loads(response.read().decode('utf-8','ignore'))
 
 def _do_post_path(c,path,payload):
     req=urllib.request.Request(_join(c['api_base'],path),data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=_headers(c),method='POST')

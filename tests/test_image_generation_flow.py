@@ -46,6 +46,13 @@ def sample_report():
 
 
 class ImageGenerationFlowTest(unittest.TestCase):
+    def setUp(self):
+        # Routing tests use fake URLs/providers. Exercise real byte transport
+        # separately in test_reference_generation_contract.py.
+        transport=patch.object(app, '_reference_data_url', side_effect=lambda value:value)
+        transport.start()
+        self.addCleanup(transport.stop)
+
     def test_image_model_is_independent_and_required(self):
         with patch('ai_client.load_config', return_value={'api_key': 'test', 'model': 'text-only', 'image_model': '', '_config_error': ''}):
             with self.assertRaisesRegex(RuntimeError, '独立的生图模型'):
@@ -220,7 +227,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('浅色高端酒店感', direction['accepted'])
         self.assertTrue(any('Logo' in x for x in direction['rejected']))
         prompt = app.build_image_prompt(report, plan, slots[0]['assetType'], 0, slots[0], direction)
-        self.assertIn('高优先级用户输入', prompt)
+        self.assertIn('本图用户要求', prompt)
         self.assertIn('浅色高端酒店感', prompt)
         self.assertIn('仅拦截的用户要求', prompt)
 
@@ -304,8 +311,8 @@ class ImageGenerationFlowTest(unittest.TestCase):
 
         overview_prompt = app.build_image_prompt(report, plan, slots[0]['assetType'], 0, slots[0], overview)
         material_prompt = app.build_image_prompt(report, plan, slots[2]['assetType'], 2, slots[2], material_main)
-        self.assertNotIn('高优先级用户输入', overview_prompt)
-        self.assertIn('高优先级用户输入', material_prompt)
+        self.assertNotIn('本图用户要求', overview_prompt)
+        self.assertIn('本图用户要求', material_prompt)
 
     def test_per_slot_edit_uses_same_safety_and_relation_gate(self):
         report = sample_report()
@@ -420,13 +427,13 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('产品展示状态必须具体复现', enabled)
         self.assertIn('动作状态必须具体复现', enabled)
         self.assertIn('支撑点、遮挡关系、部件相对位置', enabled)
-        self.assertIn('action direction and action phase', enabled)
+        self.assertIn('human touch points and action phase', enabled)
         self.assertIn('业务目标（不可丢失）', enabled)
         self.assertIn('产品目标（不可丢失）', enabled)
         self.assertNotIn('规格透明款', enabled)
         self.assertIn('保持用户最终确认的商品品类', enabled)
-        enabled_benchmark = enabled[enabled.index('爆款商品特征借鉴') : enabled.index('本套图中的第')]
-        self.assertIn('只借鉴高转化的信息层级、证明顺序、文字层次和转化逻辑', enabled_benchmark)
+        enabled_benchmark = enabled[enabled.index('参考图表达：') : enabled.index('本套图中的第')]
+        self.assertIn('保留对应参考图的表达主题、文字层次和信息阅读顺序', enabled_benchmark)
         self.assertNotIn('借鉴爆款主图/详情图的高转化结构、主体占比、场景钩子', enabled_benchmark)
         self.assertIn('以参考图拍摄语言为主', enabled)
         self.assertIn('最小适配', enabled)
@@ -434,6 +441,25 @@ class ImageGenerationFlowTest(unittest.TestCase):
         # source of truth instead of inheriting the reference shoot.
         self.assertIn('商品主体占画面60-80%', disabled)
         self.assertNotEqual(disabled, enabled)
+
+    def test_image_copy_follows_visible_reference_copy_state(self):
+        report = sample_report()
+        plan = report['experienceSolution']['newProductPlans']['plans'][0]
+        slot = app.build_generation_slots(report, plan)[0]
+        prompt = app.build_image_prompt(
+            report, plan, 'main', 0, slot,
+            product_reference_mode='uploaded_reference',
+            match_reference_shooting=True,
+        )
+        self.assertIn('参考图文案跟随规则', prompt)
+        self.assertIn('参考图有文字时严格保持文字相对位置', prompt)
+        self.assertIn('生成并真实绘制一个与该主题对应的简短中文主标题', prompt)
+        self.assertIn('Missing OCR is not evidence', prompt)
+        self.assertIn('不能用固定槽位任务改换参考图主题', prompt)
+        self.assertNotIn('Never import another product, logo, text', prompt)
+        self.assertNotIn('本图不要添加标题、参数字', prompt)
+        self.assertEqual(slot['referenceAnalysis']['signals'], ['六件配齐'])
+        self.assertNotIn('若无法可靠渲染中文则留白给后期排版', prompt)
 
     def test_reference_shooting_prompt_freezes_first_main_product_and_is_bilingual(self):
         report = sample_report()
@@ -456,8 +482,8 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('只有“产品目标”或用户最终设定明确列出的字段可以改变', first)
         self.assertIn('当前槽位继续继承同一产品身份', second)
         self.assertNotIn('首张主图（main:1）', second)
-        self.assertIn('【English constraints】Match both the reference shooting grammar', first)
-        self.assertIn('Preserve the current product silhouette', first)
+        self.assertIn('【English constraints】Input image 1 supplies current product identity only', first)
+        self.assertIn('Preserve the current product appearance from image 1', first)
         # Business/product goals must be stated before the lower-priority
         # shooting language so a provider cannot trade conversion intent for
         # visual imitation.
@@ -465,6 +491,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
 
     def test_reference_shooting_toggle_is_persisted_on_worker_and_each_result(self):
         report = sample_report()
+        report['facts']['images']={'main':['https://example.test/collected-main-1.jpg']}
         job_id = 'img_test_reference_shooting_toggle'
         prompts = []
 
@@ -873,12 +900,17 @@ class ImageGenerationFlowTest(unittest.TestCase):
         report = sample_report()
         job_id = 'img_test_prompt_override'
         prompts = []
+        resolution={'productUpdates':[], 'globalInstructions':[], 'perSlot':{
+            f"{s['assetType']}:{s['index']}":{'instructions':['主图构图改为更清爽，背景留白更大'] if s['assetType']=='main' and s['index']==1 else [],
+                                           'theme':'保留方案方向','display':'按本图对应参考适配','copy':'依据当前商品生成中文文案'}
+            for s in app.build_generation_slots(report,report['experienceSolution']['newProductPlans']['plans'][0])}}
         def fake_generate(prompt, **kwargs):
             prompts.append(prompt)
             return {'data': [{'b64_json': 'unused'}]}
         with tempfile.TemporaryDirectory() as tmp, \
              patch.object(app, 'GENERATED_ASSET_ROOT', Path(tmp) / 'assets'), \
              patch.object(app, 'REPORTS', Path(tmp) / 'reports'), \
+             patch.object(app, 'chat_json', return_value=resolution), \
              patch.object(app, 'image_generate', side_effect=fake_generate), \
              patch.object(app, '_save_generated_item', return_value={'url': '/reports/assets/generated/test/01.png', '_path': '/tmp/01.png'}):
             app.GENERATED_ASSET_ROOT.mkdir(parents=True)
@@ -888,11 +920,11 @@ class ImageGenerationFlowTest(unittest.TestCase):
                                                      'selectedSlots': ['main:1'], 'referenceImages': ['data:image/png;base64,AAAA'],
                                                      'promptOverrides': {'main:1': '主图构图改为更清爽，背景留白更大'}})
             app.IMAGE_JOBS.pop(job_id)
-            self.assertIn('每张图用户编辑提示词', prompts[0])
+            self.assertIn('统一产品—方案—参考关系', prompts[0])
             self.assertIn('主图构图改为更清爽', prompts[0])
-            self.assertIn('内置关联提示词', prompts[0])
+            self.assertIn('方案默认产品与页面方向继续保留', prompts[0])
             self.assertNotIn('规格透明款', prompts[0])
-            self.assertIn('不可覆盖约束', prompts[0])
+            self.assertIn('统一执行规则', prompts[0])
 
     def test_unrelated_per_slot_prompt_override_does_not_replace_plan(self):
         report = sample_report()

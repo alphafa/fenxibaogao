@@ -1518,6 +1518,7 @@ def analyze(raw, progress=lambda *a:None):
     main_imgs=raw.get('images',{}).get('main',[])[:8]
     if use_ai and main_imgs:
         prompt='''任务B｜主图商业信息提炼。目标不是解释图片，而是让专业用户一眼看到“这张图在卖什么”。逐张提炼图片中可核验的商品信息标签，再给一个短动作。
+同时逐图记录可见展示空间关系，放入evidenceDetail.displayRelations：{"visibleParts":[{"id":"局部1","description":"可见区域，不把折叠层误认为独立件数"}],"relations":[{"type":"连接|接触|覆盖|遮挡|方向|相对位置|形变","from":"局部1","to":"局部2","observation":"看得见的关系"}],"view":"观察视角","uncertainAreas":["不可见且不能确认的部分"]}。只记录实际图中的关系；折叠、悬挂、手持、铺展等共用此描述，不套固定状态模板，不猜隐藏结构、件数或操作过程。产品固有组成与摆放形成的折边、接触、覆盖必须区分；详细关系不适用页面标签字数限制。
 输出：
 {"visualThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"coreClaims":[],"imageRoles":[{"imageEvidenceId":"IMG_MAIN_0001","imageRole":"<=8字","visualSignals":["2-3个，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"product_overview|usage_scene|material_touch|structure_function|spec_choice","evidenceIds":[],"confidence":0}],"evidenceDetail":[{"imageEvidenceId":"IMG_MAIN_0001","composition":"","textInfo":"","productSubject":"","patternColor":"","evidenceIds":[]}]}
 visualSignals必须来自图片可见文字、商品、场景或已确认参数，例如“40支全棉/六件套/90×190cm”，不能写抽象评价。
@@ -1545,6 +1546,7 @@ visualSignals必须来自图片可见文字、商品、场景或已确认参数�
     detail_imgs=raw.get('images',{}).get('detail',[])[:20]
     if use_ai and detail_imgs:
         prompt='''任务D｜详情页证明信息提炼。按4-6个信息任务组选代表图，不按图片流水账。每组只提炼2-4个图片信息标签和1条专业动作。
+对实际输入图片在evidenceDetail中按imageEvidenceId记录composition与displayRelations：{"visibleParts":[{"id":"局部1","description":"可见区域"}],"relations":[{"type":"连接|接触|覆盖|遮挡|方向|相对位置|形变","from":"局部1","to":"局部2","observation":"实际可见关系"}],"view":"观察视角","uncertainAreas":["不能确认的部分"]}。区分产品固有结构与展示空间关系，不将可见层数当产品件数，不猜隐藏连接或操作过程；详细观察不按标签长度压缩，保持证据ID对应原图。
 输出：
 {"detailThesis":{"professionalOpinion":"<=45字","evidenceIds":[]},"contentGroups":[{"type":"场景证明|材质证明|结构工艺|功能表现|规格适配|使用维护","representativeImageId":"IMG_DETAIL_0001","visualSignals":["2-3项，每项<=10字"],"businessMeaning":"<=22字","nextAction":"<=18字","contentKey":"scene_problem|material_proof|structure_proof|function_proof|spec_adaptation|care_durability","imageEvidenceIds":[],"evidenceIds":[]}],"continuityChecks":[{"claim":"<=24字","mainImageEvidenceIds":[],"detailEvidenceIds":[],"status":"closed_loop|detail_missing|main_missing|conflict|review_pending","nextAction":"<=24字","evidenceIds":[]}],"pageSequence":[],"evidenceDetail":[]}
 详情顺序必须接续主图：场景证明 → 材质证明 → 结构工艺 → 功能表现 → 规格适配 → 使用维护；每组只负责一个购买疑问，不重复其他组。不要输出品牌、专利、授权、认证、奖项、包邮、物流、价格、销量、促销、客服或售后等唯一性/交易信息。

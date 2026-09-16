@@ -80,6 +80,20 @@ def build_image_generation_prompt(prompt_text):
     return body.replace('{prompt}', str(prompt_text or ''))
 
 
+def build_display_relationship_guidance(analysis, enabled=False):
+    """One category-independent relationship contract for both prompt paths."""
+    if not enabled:return ''
+    analysis=analysis if isinstance(analysis,dict) else {}
+    relations=analysis.get('displayRelations') or (analysis.get('imageObservation') or {}).get('displayRelations') or {}
+    return ('【可见展示空间关系｜对应原图约束】'+json.dumps(relations,ensure_ascii=False)
+            +'。使用实际对应参考图核对可见局部之间的连续连接、接触、覆盖顺序、遮挡、方向、相对位置和形变。'
+            '记录缺失时直接观察实际参考图，不能只按状态名称生成。保留未被用户修改的这些关系，不要求照搬参考商品固有材质或制造结构。'
+            '产品组成、缝制和配件属于固有身份；折回、垂落、抓握和摆放形成的连接/覆盖属于展示关系，两者不能混淆。'
+            '连续形变不能重构成独立物体叠放，可见层数不等于商品件数；不能根据模板补造隐藏局部或操作过程。'
+            '按参考可见关系迁移当前产品，仅允许用户明确授权及实现要求不可避免的最小调整。'
+            ' English constraints: Preserve the visible connectivity, contact, overlap order, occlusion, orientation and relative placement from the corresponding reference. Distinguish intrinsic product construction from display-induced deformation. Do not replace a continuous folded surface with separate stacked objects or infer item count from visible layers. Inspect the actual reference when recorded observations are incomplete; never invent hidden geometry.')
+
+
 def build_reference_shooting_guidance(
     enabled=False,
     asset_type='main',
@@ -145,7 +159,7 @@ def build_reference_shooting_guidance(
         first_main_rule = '当前槽位继续继承同一产品身份；只有“产品目标”或用户最终设定明确列出的字段可以改变，其他字段冻结。'
     reference_role_rule = (
         '【双参考图职责分离】第1张输入图是用户上传产品图，只允许提取商品身份、轮廓、比例、材质、颜色/花型、结构、件数和配件；'
-        '第2张输入图是采集商品当前槽位图，只允许提取机位、视角、景别、透视、构图、背景、光线、具体动作、朝向、展开/折叠、摆放、支撑/接触点、遮挡和部件关系。'
+        '第2张输入图是采集商品当前槽位图，提供表达主题、文字版式以及机位、视角、景别、透视、构图、背景、光线、具体动作、朝向、展开/折叠、摆放、支撑/接触点、遮挡和部件关系；其原文参数不能当作当前产品事实。'
         '结果必须使用第1张图的商品放入第2张图的展示状态；第2张图中的商品外观、颜色、花型、材质和结构不得覆盖第1张图。不得交换两张图的职责。'
         if hybrid else
         '【单一产品身份参考】第1张输入图是用户上传产品图，也是整套图片唯一的商品身份来源；只允许提取商品品类、轮廓、比例、材质、颜色/花型、结构、件数和配件。采集商品的文字、参数和图片只用于业务目标与证据任务，不得改变当前商品外观。'
@@ -159,21 +173,29 @@ def build_reference_shooting_guidance(
         if uploaded else
         'Use the current reference only for the product identity and the visual policy stated here; never import another product, brand or text.'
     )
+    copy_policy = (
+        '【参考图文案跟随规则】必须依据当前产品事实和对应图片分析任务生成简短中文文案并渲染到图中。文字识别缺失不代表参考图无字，必须查看实际参考图。参考图有文字时严格保持文字相对位置、大小占比、对齐、标题层级、换行、行距、留白和阅读顺序，仅替换为当前产品对应文案。不得照抄品牌、价格、促销、认证或虚构产品参数，不得默认留白取消文案。'
+    )
+    copy_policy_en = (
+        'Render short Chinese copy derived from the current product and the corresponding slot analysis. Missing OCR is not evidence that the reference is text-free. Inspect the actual collected slot reference. Preserve its text positions, relative font sizes, alignment, title hierarchy, line breaks, line spacing and margins when text is present. Never copy brands or unsupported claims. Display state and text layout take precedence over default creative styling.'
+    )
     if enabled:
         return f'''【参考图拍摄与产品展示状态一致｜已勾选｜matchReferenceShooting=true】
-策略定义：锁定参考图的拍摄语言和产品展示状态，不复制参考图的其他商品、品牌或文字。拍摄与摆放母版：{source}；本策略适用于当前{kind}。
+策略定义：锁定对应参考图的拍摄语言、产品展示状态、表达主题和文字版式；替换为当前产品及基于当前产品分析的文案，不照抄参考商品原文。拍摄与摆放母版：{source}；本策略适用于当前{kind}。
 【防止商品串图｜最高优先级】任何采集参考图都不是当前商品外观参考。严禁复制采集图中的颜色、花型、材质、纹理、轮廓、结构、件数、配件、包装或品牌；当前商品只能来自第1张上传产品图和用户最终明确设定。若视觉状态与商品外观发生冲突，保留第1张产品图外观，放弃采集图外观。
 {reference_role_rule}
-优先级（高→低）：平台合规与安全 ＞ 用户明确商品设定与统一 identityLock ＞ 产品目标/方案允许的明确变化 ＞ 当前槽位业务目标与证据任务 ＞ 本开关的参考图拍摄语言与产品展示状态 ＞ 默认构图与风格。参考一致只能约束视觉表达，不能牺牲业务目标或产品目标。
+优先级（高→低）：平台合规与安全 ＞ 当前产品身份与用户明确商品设定 ＞ 用户明确表达要求 ＞ 对应参考图的产品展示状态与文案排版 ＞ 产品方案与业务任务 ＞ 默认构图与风格。产品不能擅自改变；用户明确表达要求覆盖参考对应项，未涉及的参考约束保持有效。
 业务目标（不可丢失）：{business}。
 产品目标（不可丢失）：{product}。
 拍摄语言必须尽量一致：机位与视角、景别与主体占比、镜头透视/焦段观感、构图与裁切、背景/场景层级、光线方向与软硬度、色温与阴影、道具、视觉重心和留白节奏。
 产品展示状态必须具体复现：先识别商品是平铺、悬挂、折叠、展开、堆叠、卷起、铺设、穿着、手持、使用中还是局部掀开；再保持正反面与朝向、旋转/倾斜角度、展开或折叠程度、弯曲/垂落/褶皱状态、落点与画面坐标、接触面和支撑点、遮挡关系、部件相对位置、与道具/家具/人体的距离和前后层级。
 动作状态必须具体复现：若有人手或模特，保持谁在用什么部位、抓握/按压/提拉/铺开/穿戴等动作、手指或身体接触点、发力方向、动作阶段和姿态；不得把“正在动作”改成静态陈列，也不得把静态陈列擅自改成动作场景。先逐项分析实际参考图，再迁移到当前商品。
 商品保真：{first_main_rule}
-适配规则：当前槽位的卖点/证据任务必须清楚可见；迁移拍摄语言和产品展示状态，但不把参考图中的其他商品、品牌 Logo、文字、无关装饰、包装或未证实卖点带入画面。若画布比例必须变化，优先扩展背景或留白，不改变商品摆放、动作、朝向和部件关系。
+适配规则：在对应参考图既有展示状态与文字版式中表达当前产品的可核验信息；不引入其他商品、品牌Logo或未证实卖点。先锁定产品摆放、动作、朝向、主体占比和部件关系，再精简文案适配原有文字区域，不能为文案重新构图或移动商品。
 {reference_role_rule_en}
-【English constraints】Match both the reference shooting grammar and the collected slot image's display state, not the uploaded product image's camera angle. Input image 1 is the product identity master; input image 2 is the display-state master. Preserve camera angle, shot scale, perspective, framing/crop, background layers, lighting, shadows, props and negative space from input image 2. Reproduce the exact display/action state: flat-laid, hung, folded, unfolded, stacked, rolled, spread, worn, held or in-use; preserve orientation, rotation, fold/unfold amount, drape, wrinkles, placement coordinates, support/contact points, occlusion, part relationships, human touch points, action direction and action phase. Preserve the current product silhouette, proportions, material, color/pattern, construction, quantity and accessories from input image 1; the uploaded product image is the only identity reference. Never let input image 2's product appearance override input image 1. Keep the business goal and current slot proof visible. Never import another product, logo, text, watermark or unverified claim.
+{copy_policy}
+{copy_policy_en}
+【English constraints】Input image 1 supplies current product identity only. Input image 2 supplies the corresponding expression theme, shooting grammar, exact display/action state and text layout. Preserve its camera angle, shot scale, perspective, framing, background, lighting, shadows, props, negative space, orientation, fold/unfold amount, drape, placement, support/contact points, occlusion, part relationships, human touch points and action phase. Preserve the current product appearance from image 1. Render new Chinese copy supported by current product facts in the corresponding text positions, sizes, alignment, hierarchy and line spacing of image 2. Shorten copy to fit; never move or resize the product or change its display state to make room for text. Never copy another product identity, logo, original wording, watermark or unsupported claim.
 '''
     return f'''【参考图拍摄与产品展示状态一致｜未勾选｜matchReferenceShooting=false】
 策略定义：不继承参考图的拍摄语言或产品展示状态。参考来源：{source}；参考图只用于核对当前商品身份、结构、材质、颜色和比例。
@@ -182,5 +204,7 @@ def build_reference_shooting_guidance(
 产品目标（不可丢失）：{product}。
 商品保真：{first_main_rule}
 {reference_role_rule_en}
+{copy_policy}
+{copy_policy_en}
 【English constraints】Use the reference only as a product-identity anchor. Do not copy its camera angle, shot scale, perspective, framing, background, lighting, props, display/action state, orientation, folding, placement, support/contact points, occlusion or part relationships. Design a clear ecommerce shot for the current business goal while preserving the current product identity and approved product changes.
 '''

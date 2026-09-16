@@ -12,10 +12,11 @@ from renderer import render
 from ai_client import (
     configured, load_config, probe_model_api, probe_image_api, image_generate,
     image_model_options, normalize_image_quality, IMAGE_QUALITY_OPTIONS,
+    _ssl_context, chat_json,
 )
 from prompt_templates import (
     TEMPLATES, PRODUCT_VARIABLES, build_image_generation_prompt,
-    build_reference_shooting_guidance,
+    build_reference_shooting_guidance, build_display_relationship_guidance,
 )
 
 ROOT=Path(__file__).resolve().parent
@@ -34,6 +35,8 @@ LOCK=threading.Lock()
 IMAGE_ASSET_ROOT=REPORTS/'assets'; IMAGE_ASSET_ROOT.mkdir(exist_ok=True)
 GENERATED_ASSET_ROOT=IMAGE_ASSET_ROOT/'generated'; GENERATED_ASSET_ROOT.mkdir(exist_ok=True)
 IMAGE_JOBS={}
+IMAGE_INTENT_CACHE={}
+IMAGE_INTENT_LOCK=threading.Lock()
 
 def _image_model_specs(request=None):
     """Resolve selected comparison models, falling back to the configured default."""
@@ -119,7 +122,7 @@ def _download_image(url, timeout=18):
             }
             headers.update(extra)
             req=urllib.request.Request(url,headers=headers)
-            with urllib.request.urlopen(req,timeout=timeout) as r:
+            with urllib.request.urlopen(req,timeout=timeout,context=_ssl_context(load_config())) as r:
                 data=r.read(16*1024*1024+1)
                 if len(data)>16*1024*1024:raise ValueError('image too large')
                 ctype=r.headers.get('Content-Type','')
@@ -250,7 +253,7 @@ def _visual_title(title, brand='', blocked_terms=()):
     return ' '.join(parts).strip() or '商品主体'
 
 def _image_user_direction(value, blocked_terms=()):
-    text=re.sub(r'\s+',' ',str(value or '')).strip()[:500]
+    text=str(value or '').strip()
     blocked_terms=tuple(str(x) for x in blocked_terms if x)
     if not text: return {'raw':'','accepted':[],'rejected':[],'ignored':[],'items':[],'blockedTerms':list(blocked_terms)}
     risky=tuple(VISUAL_EXCLUDED_TERMS)+blocked_terms+(
@@ -274,13 +277,13 @@ def _image_user_direction(value, blocked_terms=()):
         if any(term in part for term in identity_same_terms):
             return 'product'
         return 'product' if has_product_term and has_change_term and not has_presentation_term else 'visual'
-    parts=[x.strip(' ，,。；;、') for x in re.split(r'[。；;，,\n]+',text) if x.strip(' ，,。；;、')]
+    parts=[x.strip(' ，,。；;、') for x in re.split(r'[。；;，,、\n]+',text) if x.strip(' ，,。；;、')]
     accepted=[]; rejected=[]; items=[]; product_overrides=[]
-    for part in parts[:8]:
+    for part in parts:
       reason=risky_reason(part)
       if reason:
         rejected.append(part[:80]); items.append({'text':part[:80],'status':'rejected','reason':reason}); continue
-      clean=_visual_clean(part,40,blocked_terms)
+      clean=[part]
       if clean:
         scope=scope_of(part)
         accepted.extend(clean)
@@ -302,16 +305,16 @@ def _image_user_direction(value, blocked_terms=()):
             if item.get('text') in identity_parts:
                 item['scope']='product'
         items.append({'text':identity_rule,'status':'accepted','scope':'product','reason':'全局商品身份约束'})
-    accepted=list(dict.fromkeys(accepted))[:6]
-    rejected=list(dict.fromkeys(rejected))[:6]
+    accepted=list(dict.fromkeys(accepted))
+    rejected=list(dict.fromkeys(rejected))
     return {'raw':text,'accepted':accepted,'rejected':rejected,'ignored':[],
-            'productOverrides':list(dict.fromkeys(product_overrides))[:6],
+            'productOverrides':list(dict.fromkeys(product_overrides)),
             'items':items,'blockedTerms':list(blocked_terms)}
 
 def _prompt_override(value):
     text=str(value or '').strip()
     if not text: return ''
-    return text[:7000]
+    return text
 
 def _slot_relation_terms(slot):
     slot=slot if isinstance(slot,dict) else {}
@@ -378,6 +381,12 @@ def _prompt_edit_relevance(text, slot, user_direction=None):
 def _user_direction_for_slot(direction, slot):
     """Keep only safe global user direction that is relevant to this image slot."""
     direction=direction if isinstance(direction,dict) else {}
+    if 'resolvedBySlot' in direction:
+        key=f"{slot.get('assetType')}:{slot.get('index')}"
+        resolved=direction['resolvedBySlot'].get(key) or {}
+        return {**direction,
+                'accepted':list(dict.fromkeys(direction.get('globalInstructions',[])+resolved.get('instructions',[]))),
+                'ignored':[], 'slotResolution':resolved}
     accepted=[]; rejected=list(direction.get('rejected') or []); ignored=[]; matched=[]
     items=direction.get('items') or [
       {'text':value,'status':'accepted','scope':'visual','reason':''} for value in direction.get('accepted') or []
@@ -437,9 +446,101 @@ def _apply_product_overrides(direction, overrides):
     direction['accepted']=list(dict.fromkeys(direction['accepted']))[:12]
     return direction
 
+def _resolve_image_user_intent(report, plan, slots, direction, prompt_overrides, reference_images, match_reference_shooting):
+    """Resolve the same product/plan/reference relationship for preview and generation.
+
+    No input means no extra model call or automatic replanning. Explicit input
+    is interpreted once with the full plan and corresponding image analyses;
+    fixed navigation labels never decide whether a request is discarded.
+    """
+    edits={key:_prompt_override(value) for key,value in (prompt_overrides or {}).items() if _prompt_override(value)}
+    if not direction.get('raw') and not edits:
+        return direction
+    payload={'product':(report.get('facts') or {}).get('product') or {},
+             'attributes':(report.get('facts') or {}).get('attributes') or {},
+             'plan':plan, 'userInput':direction.get('raw') or '', 'perImageInput':edits,
+             'matchReferenceShooting':bool(match_reference_shooting),
+             'images':[{'key':f"{s.get('assetType')}:{s.get('index')}", 'task':s.get('task') or [],
+                        'referenceAnalysis':s.get('referenceAnalysis') or {}} for s in slots]}
+    encoded=json.dumps({'payload':payload,'identityImages':reference_images[:1]},ensure_ascii=False,sort_keys=True)
+    cache_key=hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+    with IMAGE_INTENT_LOCK:
+        cached=IMAGE_INTENT_CACHE.get(cache_key)
+    if cached is None:
+        system='''你是电商生图的统一意图解析器。只输出JSON，不生图、不重做报告。
+所选方案是默认底座。结合用户完整输入、产品图片、品类、产品信息及每张对应参考图分析，判断用户明确要求与必然关联的调整。不得靠固定槽位名称决定主题，不得丢弃没有关键词匹配的有效输入。
+没有被要求改变的方案方向继续保留。换品类也不自动清空方案、要求补资料或重分析；保留适用的主题并适配新品。只有用户要求重策划才调整整体方向。旧品专属参数不能冒充新品事实；没有新品参数时保留适用表达方向，使用有依据的可见描述，不编造数值。
+全局输入须判断对每张图的影响；单图视觉输入只作用对应key，但其中明确的产品/品类修改应作用整套商品。产品、品类、用途、人群、场景、卖点及文案间的必然关联须同步。
+开启参考一致时，对应参考图的展示状态和文字位置、大小、层级、对齐、排版是默认约束；同品复现，跨品类保留适用构图关系与展示意图，不强迫新品执行不适用的动作。用户明确改变某项展示或排版时仅覆盖该项，其余保持参考。文案主题参考对应图，内容按当前产品和用户要求调整。
+上传图提供默认身份，用户明确要求换品类/产品/属性时覆盖对应字段，不能同时要求新品与旧品类完全一致。用户输入是指令，不自动逐字印在图上；明确指定标题原文则按要求执行。不得生成品牌Logo、交易促销、认证或未证实宣称。
+输出结构：{"productUpdates":[{"field":"category|productName|material|color|specification|purpose|audience|sellingPoint","value":"明确的新内容","sourceText":"用户输入中的原文片段"}],"globalInstructions":["整套图须执行的调整"],"perSlot":{"main:1":{"instructions":["本图采纳的要求"],"theme":"本图方案主题如何适配当前产品","display":"与对应参考图的展示关系","copy":"本图文案内容与参考排版的关系"}}}。
+productUpdates只能来自用户明确输入，每项sourceText必须逐字出自userInput或perImageInput。必须覆盖传入的所有图片key。无调整的字段不输出更新，instructions可为空，保留默认方案和参考关系。所有指令应可追溯至输入或方案，不能擅自新增商品变化。'''
+        analysis_error=''
+        try:
+            resolved=chat_json(system,json.dumps(payload,ensure_ascii=False),images=reference_images[:1] or None,max_tokens=6500)
+        except Exception as error:
+            # Intent interpretation is advisory, not a second mandatory gateway.
+            # Preserve the actual instructions for the multimodal generation
+            # model to interpret with the same plan/reference/product context.
+            resolved={}
+            analysis_error=str(error)
+        original_result=resolved
+        resolved=dict(resolved) if isinstance(resolved,dict) else {}
+        def texts(value):
+            if isinstance(value,str):return [value] if value.strip() else []
+            if not isinstance(value,list):return []
+            return [x for x in value if isinstance(x,str) and x.strip()]
+        resolved['globalInstructions']=texts(resolved.get('globalInstructions',[]))
+        per_slot=resolved.get('perSlot')
+        resolved['perSlot']=dict(per_slot) if isinstance(per_slot,dict) else {}
+        for slot in slots:
+            key=f"{slot.get('assetType')}:{slot.get('index')}"
+            item=resolved['perSlot'].get(key)
+            item=dict(item) if isinstance(item,dict) else {}
+            for field in ('theme','display','copy'):
+                if not isinstance(item.get(field),str):item[field]=''
+            item['instructions']=texts(item.get('instructions',[]))
+            resolved['perSlot'][key]=item
+        all_input='\n'.join([direction.get('raw') or '']+list(edits.values()))
+        updates=resolved.get('productUpdates',[])
+        fields={'category','productName','material','color','specification','purpose','audience','sellingPoint'}
+        safe_updates=[]
+        for update in updates if isinstance(updates,list) else []:
+            if isinstance(update,dict) and update.get('field') in fields and isinstance(update.get('value'),str) and update['value'].strip() and isinstance(update.get('sourceText'),str) and update['sourceText'] and update['sourceText'] in all_input:
+                safe_updates.append(update)
+        resolved['productUpdates']=safe_updates
+        if isinstance(updates,list) and len(safe_updates)!=len(updates):
+            # A rejected identity inference may already have contaminated every
+            # slot's display/theme prose. Keep the raw response for diagnosis,
+            # but never pass that ungrounded narrative to generation.
+            resolved['globalInstructions']=[]
+            resolved['perSlot']={f"{slot.get('assetType')}:{slot.get('index')}":{
+                'instructions':[],'theme':'','display':'','copy':''} for slot in slots}
+        resolved['analysisRecord']={'response':original_result,'error':analysis_error}
+        # JSON copy prevents a slot/prompt mutation from altering the shared result.
+        cached=json.dumps(resolved,ensure_ascii=False)
+        with IMAGE_INTENT_LOCK:
+            if len(IMAGE_INTENT_CACHE)>=32:
+                IMAGE_INTENT_CACHE.pop(next(iter(IMAGE_INTENT_CACHE)))
+            IMAGE_INTENT_CACHE[cache_key]=cached
+    resolved=json.loads(cached)
+    result=dict(direction)
+    result.update({'resolvedBySlot':resolved['perSlot'], 'globalInstructions':resolved['globalInstructions'],
+                   'perImageInput':edits,'analysisRecord':resolved.get('analysisRecord'),
+                   'productUpdates':resolved.get('productUpdates',[]),
+                   'productOverrides':[f"{u['field']}：{u['value']}" for u in resolved.get('productUpdates',[])],
+                   'accepted':resolved['globalInstructions'], 'ignored':[]})
+    return result
+
 def merge_image_prompt_with_user_edit(base_prompt, edit_text, slot, user_direction=None):
     """Fuse per-image user edits with the built-in visual strategy only when relevant."""
     edit=_prompt_override(edit_text)
+    if isinstance(user_direction,dict) and 'resolvedBySlot' in user_direction:
+        # The complete edit has already been interpreted with the shared product
+        # context and this reference. Do not append it again with a competing
+        # "highest priority" instruction or re-run the keyword relevance filter.
+        return base_prompt, {'mode':'applied' if edit else 'builtin','related':bool(edit),
+                             'matched':user_direction.get('accepted') or [],'ignored':[]}
     if not edit:
         return base_prompt, {'mode':'builtin','related':False,'matched':[],'ignored':[]}
     blocked_terms=((user_direction or {}).get('blockedTerms') or ()) if isinstance(user_direction,dict) else ()
@@ -509,11 +610,14 @@ def build_identity_lock(report, plan, user_direction=None, uploaded_product_iden
     )) if isinstance(user_direction,dict) else []
     identity_text='|'.join([title,brand,';'.join(fields),';'.join(selling),';'.join(user_overrides)])
     identity_id='identity_'+hashlib.sha256(identity_text.encode('utf-8')).hexdigest()[:12]
+    updates=(user_direction or {}).get('productUpdates') or []
+    for update in updates:
+        if update.get('field') in ('category','productName'):title=update['value']
     return {
       'id':identity_id,'productName':title,'brand':brand,'verifiedFacts':fields,
       'userOverrides':user_overrides,
       'sellingPoints':selling,
-      'mustKeep':['上传产品图中的商品品类、轮廓、比例、材质、颜色/花型、结构、件数和配件' if uploaded_product_identity else '商品品类','用户未明确修改的商品字段','同一套图片共享同一最终商品设定'],
+      'mustKeep':['上传产品图或方案提供默认身份，用户明确修改的品类/产品字段及其必然关联变化覆盖默认身份' if updates else '上传产品图中的商品品类、轮廓、比例、材质、颜色/花型、结构、件数和配件' if uploaded_product_identity else '商品品类','用户未明确修改且适用于当前产品的商品字段','同一套图片共享同一最终商品设定'],
       'mustNotChange':['品牌Logo、价格、销量、水印或二维码','认证、专利、授权及其他未证实平台宣称','用户未明确要求的额外商品变化']
     }
 
@@ -524,6 +628,26 @@ def build_generation_slots(report, plan):
     detail=exp.get('detailCommerce') or {}
     main_items=[x for x in (visual.get('items') or []) if isinstance(x,dict)]
     detail_items=[x for x in (detail.get('contentGroups') or []) if isinstance(x,dict)]
+    raw_visual=report.get('visualDecision') or {}
+    raw_detail=report.get('detailDecision') or {}
+    # Report presentation normalizes roles by position. Generation needs the
+    # original image analysis, not those rewritten presentation roles.
+    original_main={str(x.get('imageEvidenceId')):x for x in raw_visual.get('imageRoles',[]) if isinstance(x,dict) and x.get('imageEvidenceId')}
+    original_detail={str(x.get('representativeImageId') or x.get('imageEvidenceId')):x for x in raw_detail.get('contentGroups',[]) if isinstance(x,dict) and (x.get('representativeImageId') or x.get('imageEvidenceId'))}
+    original_observations={str(x.get('imageEvidenceId')):x for block in (raw_visual,raw_detail,visual,detail) for x in block.get('evidenceDetail',[]) if isinstance(x,dict) and x.get('imageEvidenceId')}
+    # Raw observations win over the optional presentation detail.
+    original_observations.update({str(x.get('imageEvidenceId')):x for block in (raw_visual,raw_detail) for x in block.get('evidenceDetail',[]) if isinstance(x,dict) and x.get('imageEvidenceId')})
+    # Keep the OCR/text observation attached to the corresponding collected
+    # image slot.  It is separate from visualSignals so the image prompt can
+    # preserve a reference's copy-led layout without inventing copy.
+    text_by_image_id={
+        str(x.get('imageEvidenceId') or ''): str(x.get('textInfo') or '').strip()
+        for x in (visual.get('evidenceDetail') or []) if isinstance(x,dict) and x.get('imageEvidenceId')
+    }
+    text_by_image_id.update({
+        str(x.get('imageEvidenceId') or ''): str(x.get('textInfo') or '').strip()
+        for x in (detail.get('evidenceDetail') or []) if isinstance(x,dict) and x.get('imageEvidenceId')
+    })
     selling=[x for x in (plan or {}).get('sellingPoints',[]) if isinstance(x,dict)]
     if not main_items:
         main_items=[{'imageRole':'主商品全貌','visualSignals':_text_list(x.get('slogan') or x.get('consumerValue')),'nextAction':'完整展示商品与核心卖点'} for x in selling[:5]]
@@ -566,6 +690,15 @@ def build_generation_slots(report, plan):
                     if candidate_index not in used_source:
                         source=candidate;source_index=candidate_index;break
             if source_index is not None:used_source.add(source_index)
+            original=(original_main if asset_type=='main' else original_detail).get(eid)
+            if original is not None:
+                source=original
+            observation=original_observations.get(eid) or {}
+            reference_text = ''
+            if isinstance(source,dict):
+                reference_text = str(source.get('textInfo') or '').strip()
+            if not reference_text and eid:
+                reference_text = str(observation.get('textInfo') or text_by_image_id.get(eid, ''))
             refs=[]
             if isinstance(source,dict):
                 refs.extend(x for x in source.get('evidenceIds',[]) or [] if x in valid_ids)
@@ -588,7 +721,19 @@ def build_generation_slots(report, plan):
                 'planPageAction':_visual_clean((plan or {}).get('pageAction'),36,blocked_terms),
                 'handoff':f"本图完成{definition['role']}后，继续进入下一项产品证明",
                 'avoidTopics':['其他图片已承担的卖点','品牌/专利/授权/物流/交易信息'],
-                'evidenceIds':refs
+                'evidenceIds':refs,
+                'referenceTextInfo':reference_text,
+                'collectedReferenceEvidenceId':eid,
+                'referenceAnalysis': {
+                    'theme':str((source or {}).get('imageRole') or (source or {}).get('type') or ''),
+                    'signals':((source or {}).get('visualSignals') or []) if isinstance((source or {}).get('visualSignals'),list) else [str((source or {}).get('visualSignals'))] if (source or {}).get('visualSignals') else [],
+                    'meaning':(source or {}).get('businessMeaning') or '',
+                    'composition':str(observation.get('composition') or ''),
+                    'productSubject':str(observation.get('productSubject') or ''),
+                    'displayRelations':observation.get('displayRelations') or (source or {}).get('displayRelations') or {},
+                    'imageRoleAnalysis':source or {},
+                    'imageObservation':observation,
+                },
             })
         return result
 
@@ -672,6 +817,8 @@ def _collected_slot_reference(report, slot):
         }
 
     ids=[str(x) for x in (slot.get('evidenceIds') or []) if str(x)]
+    if slot.get('collectedReferenceEvidenceId'):
+        ids.insert(0,str(slot['collectedReferenceEvidenceId']))
     evidence_id=next((x for x in ids if x.startswith(prefix) and _evidence_image_url(report,x)),'')
     if not evidence_id:
         candidate=f'{prefix}{index:04d}'
@@ -733,7 +880,7 @@ def _slot_reference_images(report, slot, reference_images, reference_source, ref
     }
     if not refs:
         return [],meta
-    if reference_mode=='fission_followup':
+    if reference_mode=='fission_followup' and not _coerce_bool(match_reference_shooting, False):
         meta['referenceBinding']='generated_fission_base'
         return refs[:1],meta
     collected=_collected_slot_reference(report,slot)
@@ -800,6 +947,27 @@ def image_reference_mode(reference_source, fission_pattern=False, slot=None, mat
     if not fission_pattern: return 'collected_reference'
     slot=slot if isinstance(slot,dict) else {}
     return 'fission_base' if slot.get('assetType')=='main' and slot.get('index')==1 else 'fission_followup'
+
+def _reference_data_url(value):
+    """Materialize guidance before generation; a URL alone is not proof of input."""
+    value=str(value or '').strip()
+    if value.startswith('data:image/'):
+        return value
+    if value.startswith('/reports/'):
+        target=(REPORTS/value[len('/reports/'):]).resolve()
+        if REPORTS.resolve() not in target.parents or not target.is_file():
+            raise ValueError('参考图片文件不存在或路径无效')
+        data=target.read_bytes(); ctype=mimetypes.guess_type(target.name)[0] or ''
+    elif value.startswith(('http://','https://')):
+        data,ctype=_download_image(value)
+    else:
+        raise ValueError('参考图片地址无效')
+    if len(data)>16*1024*1024 or not _looks_like_image(data,ctype):
+        raise ValueError('参考图不是有效图片或超过大小限制')
+    ctype=ctype.split(';',1)[0].strip()
+    if not ctype.startswith('image/'):
+        ctype=mimetypes.guess_type('reference'+_asset_ext(value,ctype))[0] or 'image/png'
+    return 'data:'+ctype+';base64,'+base64.b64encode(data).decode('ascii')
 
 
 def _coerce_bool(value, default=False):
@@ -900,6 +1068,7 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
     # slot defaults so the generic ecommerce composition cannot later
     # override a user's request to follow the reference shoot.
     shooting_enabled = _coerce_bool(match_reference_shooting, False)
+    display_relationship_guidance=build_display_relationship_guidance(slot.get('referenceAnalysis'),shooting_enabled)
     uploaded_identity = product_reference_mode in ('uploaded_reference','uploaded_identity_collected_reference')
     signals=_visual_clean(slot.get('task'),18,blocked_terms)
     # In hybrid mode the collected listing is only a display-state reference;
@@ -927,6 +1096,22 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
         composition='天猫首屏主图，商品主体占画面60-80%，单一核心卖点，强对比但不堆叠文字；干净背景、主体完整、移动端缩略图仍可识别'
         size='1024x1024'
         goal='主图：0.5秒内让用户看懂是什么、为什么值得点、是否适合自己'
+    reference_text_info=str(slot.get('referenceTextInfo') or '').strip()
+    reference_text_rule=(
+        f'对应采集参考图已识别到可见文字：{reference_text_info}。本图必须保留“有文字”的信息表达，并生成与当前商品事实和本槽位任务对应的短文案；不得照抄原图品牌、价格、促销、认证或其他禁用内容。'
+        if reference_text_info else
+        '本报告缺少对应图文字识别结果，这不代表参考图没有文字。必须查看实际对应采集参考图，依据本图分析任务生成当前产品的简短中文文案并真实渲染到图中；参考图有文字时，严格保持其文字位置、大小占比、对齐、层级、换行、行距和留白。不要凭缺失识别字段生成无字图，不得虚构当前产品参数。'
+    )
+    analysis_context=json.dumps(slot.get('referenceAnalysis') or {},ensure_ascii=False)
+    reference_text_rule += (
+        f' 对应图片分析依据：{analysis_context}。'
+        '先理解实际对应参考图的表达主题，以上分析用于辅助核对，不能用固定槽位任务改换参考图主题。'
+        '本图文案交付要求：生成并真实绘制一个与该主题对应的简短中文主标题；'
+        '参考图有副标题或参数层级时，在原有区域生成对应副文案。'
+        '内容仅依据当前产品已确认事实及用户批准的产品设定；采集商品原文只提供表达主题，不能视为上传产品的参数证据。'
+        '缺乏参数证据时使用可见展示描述，不编造材质比例、尺寸或性能承诺。'
+        '文案过长时精简内容以适配参考版式，不得挪动、缩小商品或改变动作、折叠程度、主体占比来腾出文字区域。'
+    )
     visual_title=_visual_title(title,brand,blocked_terms)
     product_name=(
         f'''商品文字上下文：仅用于业务目标、证据任务和页面表达；当前商品外观完全由第1张上传产品图决定，采集商品标题、参数、颜色、材质、结构和视觉分析不得改变它。'''
@@ -941,9 +1126,18 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
     page_action=_visual_clean(without_plan_name(plan.get('pageAction')),36,blocked_terms)
     plan_rule=f"产品与页面执行约束：产品必须落实：{'；'.join(product_action) or '以已确认商品事实为基础形成明确差异'}；整套图片必须落实：{'；'.join(page_action) or '主图提出购买理由，详情逐项完成证据证明'}。"
     slot_rule=f"本套图中的第{slot.get('index')}个{asset_type}位：{slot.get('role') or '通用'}；唯一任务：{'；'.join(signals) or '保持商品主体清晰'}；承接：{slot.get('handoff') or slot.get('nextAction') or '不偏离当前产品证明'}。"
+    if shooting_enabled:
+        source_analysis=slot.get('referenceAnalysis') or {}
+        slot_rule=(
+            f"本套图中的第{slot.get('index')}个{asset_type}位：以对应参考图实际表达为准；"
+            f"原始图片主题：{source_analysis.get('theme') or '查看对应参考图确定'}；"
+            f"原始展示与构图观察：{source_analysis.get('composition') or '记录缺失，查看对应参考图确定，不能按固定任务重拍'}。"
+            '此处描述的是采集图的展示，不授权复制其产品身份。固定槽位名称只用于导航，不约束本图拍摄或改变参考图主题。'
+        )
+        proof='；'.join(str(item) for item in (source_analysis.get('signals') or [])) or '根据对应参考图的实际表达主题组织当前产品信息'
     accepted=user_direction.get('accepted') or []
     product_overrides=user_direction.get('productOverrides') or []
-    user_rule=f"【最高优先级用户输入】以下内容是本次图片的最终创作要求，优先级高于报告事实、参考图默认外观、自动生成的新品方案、当前图片默认任务和其他默认提示；用户明确指定的材质、颜色、结构、件数、尺寸、规格、花型、款式、功能或视觉表达必须执行：{'；'.join(accepted)}。" if accepted else ''
+    user_rule=f"【本图用户要求】以下要求在方案底座上执行，仅覆盖明确要求及必然关联的内容；未涉及的方案方向和参考约束保持有效：{'；'.join(accepted)}。" if accepted else ''
     product_rule=f"【用户最终商品设定｜整套图片共享】用户明确修改的商品字段覆盖报告默认字段和参考图默认外观，所有主图、详情图及裂变基准图必须统一执行：{'；'.join(product_overrides)}。" if product_overrides else ''
     rejected=user_direction.get('rejected') or []
     ignored=user_direction.get('ignored') or []
@@ -953,7 +1147,7 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
         # When matching a reference shoot, conversion learnings may still
         # inform information hierarchy, but must not silently replace the
         # reference camera grammar with our default subject ratio/background.
-        benchmark_rule='爆款商品特征借鉴：只借鉴高转化的信息层级、证明顺序、文字层次和转化逻辑；不得借鉴或改写参考图的机位、景别、透视、主体占比、构图、场景、背景、光线、具体动作、朝向、展开/折叠、摆放位置、支撑/接触点、遮挡、部件关系或留白，也不复制对标商品外观、品牌、Logo、原文文案或未证实卖点。'
+        benchmark_rule='参考图表达：保留对应参考图的表达主题、文字层次和信息阅读顺序；必须保持其机位、景别、透视、主体占比、构图、场景、背景、光线、动作、朝向、展开/折叠、摆放、接触点、遮挡、部件关系和留白。只替换为当前产品及其对应文案，不复制参考商品外观、品牌、Logo、原文或未证实卖点。'
         composition=(
             '以参考图拍摄语言为主，仅为1024x1536详情画布、当前证明任务和移动端阅读做最小适配；'
             '保持参考图的机位、景别、透视、构图、背景、光线、主体占比、具体动作、朝向、展开/折叠、摆放位置、支撑/接触点、遮挡、部件关系和留白，不额外套用默认详情分区。'
@@ -1031,11 +1225,11 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
         '报告商品文字上下文和参考图共同提供当前商品的默认身份；用户最终商品设定可以覆盖对应字段。'
     )
     product_style_rule=(
-        '【产品图主导风格】生成图片的商品外观、颜色/花型、材质纹理、细节质感和整体视觉风格以第1张上传产品图为主；采集参考图只可提供本槽位的机位、构图、动作和摆放状态，不能提供商品风格。'
+        '【产品身份与拍摄表达分离】第1张上传产品图只确定商品外观、颜色/花型、材质纹理和结构细节，不用它的背景、机位、光线或摆放状态覆盖对应采集参考图。开启参考一致时，整体拍摄表达和文字版式由对应采集参考图确定。'
         if uploaded_identity else ''
     )
     final_priority_rule=(
-        '【最终身份优先级】平台合规 ＞ 用户明确商品设定 ＞ 第1张上传产品图的可见商品身份 ＞ 与产品图一致的报告事实和统一身份锁 ＞ 产品目标与新品方案约束 ＞ 当前槽位业务目标 ＞ 采集参考图的拍摄与展示状态 ＞ 默认构图。'
+        '【最终执行优先级】平台合规 ＞ 对应参考图的产品展示状态及文案排版 ＞ 当前产品身份与用户明确商品设定 ＞ 方案与业务任务 ＞ 默认构图和风格。用第1张图的产品复现第2张图的展示状态，文案依据当前产品分析生成；其他创作要求不得改变展示状态或文字版式。'
         if uploaded_identity else
         '【最终身份优先级】平台合规 ＞ 用户明确商品设定/统一身份锁 ＞ 产品目标与新品方案约束 ＞ 当前槽位业务目标 ＞ '+('参考图拍摄语言与产品展示状态（仅视觉表达）' if shooting_enabled else '当前槽位默认拍摄方案')+' ＞ 默认构图。'
     )
@@ -1044,9 +1238,51 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
         if uploaded_identity else
         f'类目：{category}；目标人群/场景：{audience or "以采集到的商品页面与推荐方案为准"}。'
     )
+    relation_rule=''
+    if 'resolvedBySlot' in user_direction:
+        updates=user_direction.get('productUpdates') or []
+        relation=user_direction.get('slotResolution') or user_direction['resolvedBySlot'].get(f"{asset_type}:{slot.get('index')}") or {}
+        default_plan=json.dumps({k:v for k,v in plan.items() if k not in ('name','sourceType')},ensure_ascii=False)
+        if plan_name:default_plan=default_plan.replace(plan_name,'')
+        relation_rule=(
+            '【统一产品—方案—参考关系｜本图执行依据】'
+            +json.dumps({'defaultPlan':json.loads(default_plan),'explicitProductUpdates':updates,'thisImage':relation},ensure_ascii=False)
+        )
+        relation_rule+=(
+            '。方案默认生效，仅按用户明确要求和必然关联关系调整，不自动清空、重策划或补造新品资料。'
+            '本图主题、展示和文案按上述统一关系执行，不能再被旧品专属参数、固定槽位或通用模板改回去。'
+            '未受影响的方案方向继续保留；跨品类沿用适用表达方向，不把旧品专属参数当成新品事实。'
+        )
+        category_updates=[u['value'] for u in updates if u['field']=='category']
+        if category_updates:
+            category_rule=f"当前品类以用户要求为准：{'；'.join(category_updates)}；报告与上传图的旧品类仅提供默认方案背景，不能覆盖新品类。"
+        if updates:
+            identity_basis_rule='【当前商品身份】上传产品图提供默认商品依据；用户明确产品更新及其必然关联变化覆盖对应字段。整套图保持更新后的同一商品，禁止同时复现已被替换的旧身份。'
+            product_context_rule='报告产品信息作为方案默认背景，按统一产品更新关系使用；未受影响且适用的内容保留，被替换的旧品专属信息不能当成当前产品事实。'
+            product_style_rule='商品外观以默认产品图结合用户明确产品更新为准；对应采集图提供展示和排版关系，跨品类按本图统一关系适配。'
+            product_name='当前商品文字与品类上下文按统一产品更新关系执行，不沿用冲突的旧品描述。'
+            hybrid_identity_rule='【商品更新边界】用户明确商品更新覆盖默认身份的对应字段及必然关联内容；其余适用字段保留。采集参考图不能自行改变商品身份。'
+            reference_input_rule='【输入职责】产品图是默认身份依据；对应采集图是本图展示与排版依据。结合明确产品更新执行，输入顺序不变，不得把已替换的旧品类强加给新品。'
+        slot_rule=f"本套图中的第{slot.get('index')}个{asset_type}位，主题、展示与文案按统一关系执行：{json.dumps(relation,ensure_ascii=False)}。"
+        proof=relation.get('theme') or proof
+        plan_rule='方案默认产品与页面方向继续保留；仅根据统一判断适配用户明确要求及必然关联变化，不把方案标签印成产品文案。'
+        shooting_guidance=(
+            f"【参考图拍摄与产品展示状态一致｜{'已勾选' if shooting_enabled else '未勾选'}｜matchReferenceShooting={'true' if shooting_enabled else 'false'}】"
+            +('对应采集图为本图展示与排版母版；保持适用的机位、构图、背景、光线、主体占比、动作、朝向、折叠/展开、接触点、遮挡与文字位置、大小、层级、对齐、行距及留白。跨品类按统一关系适配展示意图；只有用户明确改变的项可以覆盖，其余不变。' if shooting_enabled else '按方案及本图统一判断设计展示，不默认复制采集图的拍摄状态。')
+            +'当前产品身份由默认产品依据结合用户明确更新确定；文案随品类、产品、人群、场景、卖点及用户要求联动，参考原文不作为新品参数。'
+            +' English constraints: Follow the resolved product, plan and per-image relationship. Explicit user changes override only affected defaults and necessary dependencies. Preserve compatible reference display and typography when matching is enabled. Adapt across categories without importing obsolete product facts. Render Chinese copy for the updated product, not the old product.'
+        )
+        benchmark_rule='对应参考图的借鉴和适配仅按统一关系执行，其他爆款或默认槽位不得改写本图主题。'
+        composition=relation.get('display') or composition
+        reference_text_rule=(f'对应参考图原始文字观察：{reference_text_info}；完整图片分析：{analysis_context}。'
+                             f"本图文案执行：{relation.get('copy')}。生成并真实绘制当前产品中文文案；用户明确指定标题原文时按要求执行，其他输入作为指令而非逐字印刷。不要虚构参数或沿用不适用的旧品事实。")
+        final_priority_rule='【统一执行规则】平台合规始终有效；所选方案为默认底座；用户明确要求仅覆盖对应字段及必然关联内容；参考一致开启时保留对应图适用的展示与文字版式，除非用户明确要求改变该项；默认槽位与风格不能覆盖以上关系。'
+    facts_label='方案默认商品信息（按统一关系适配，不视为新品自动确认参数）：' if relation_rule else '报告采集商品的文字事实（仅作非视觉业务参考）：' if product_reference_mode=='uploaded_identity_collected_reference' else '已确认产品事实：'
+    identity_tail=('未受影响且适用的字段继续保持默认依据；参考展示与排版按本图统一关系执行，用户明确改变的项及跨品类必然适配不能被旧默认约束覆盖。'
+                   if relation_rule else '用户未明确修改的商品字段继续遵循产品图（混合模式）或当前参考身份基准。勾选参考一致时，采集商品对应槽位图锁定拍摄语言与产品展示/动作/摆放状态，上传图只锁定商品身份，不得覆盖产品、业务或槽位展示约束。')
     base_prompt=f'''为中国电商平台生成第{variant_index+1}版{asset_type}图片。{goal}。
 【统一产品身份锁｜{lock['id']}】
-本任务必须与同一套图片保持产品完全一致。{'报告采集商品的文字事实（仅作非视觉业务参考）：' if product_reference_mode=='uploaded_identity_collected_reference' else '已确认产品事实：'}{'；'.join(lock['verifiedFacts']) or '以当前商品参考为准'}。
+本任务必须与同一套图片保持产品完全一致。{facts_label}{'；'.join(lock['verifiedFacts']) or '以当前商品参考为准'}。
 必须保持：{'、'.join(lock['mustKeep'])}。禁止改变：{'、'.join(lock['mustNotChange'])}。
 {identity_basis_rule}
 {product_context_rule}
@@ -1064,14 +1300,48 @@ def build_image_prompt(report, plan, asset_type='main', variant_index=0, slot=No
 {plan_rule}
 {benchmark_rule}
 {slot_rule}
+{display_relationship_guidance}
 {category_rule}
+{relation_rule}
 报告默认页面信息（仅对未被用户明确修改的字段生效，不得覆盖用户最终商品设定）：{'; '.join(params) or '以商品外观为准'}。
 {f"用户最终商品设定已覆盖对应默认字段：{'；'.join(product_overrides)}。" if product_overrides else ''}
 视觉信号/证明任务：{proof}。
 视觉参考：{'；'.join(style) or '克制、真实、质感清晰'}。
 构图要求：{composition}。本图尺寸比例：{size}。如果画面出现商品局部、套件、包装或场景，必须与用户最终指定的商品设定相互对应，不得擅自引入用户未要求的其他商品变化。
-{final_priority_rule}；用户未明确修改的商品字段继续遵循产品图（混合模式）或当前参考身份基准。勾选参考一致时，采集商品对应槽位图锁定拍摄语言与产品展示/动作/摆放状态，上传图只锁定商品身份，不得覆盖产品、业务或槽位展示约束。
-硬性禁止：不要出现任何品牌或商标字样、专利、授权、认证、奖项、价格、销量、促销、物流、客服、售后、二维码或防伪信息；不要生成水印、乱码或英文占位字；不使用竞品元素；不裁切商品主体；不要擅自增加用户未要求的额外商品变化；用户明确要求的材质、颜色、结构、件数、尺寸、规格、花型、款式或功能变化必须执行；文字少而大，若无法可靠渲染中文则留白给后期排版。
+参考图文字承接：{reference_text_rule}
+{final_priority_rule}；{identity_tail}
+硬性禁止：不要出现任何品牌或商标字样、专利、授权、认证、奖项、价格、销量、促销、物流、客服、售后、二维码或防伪信息；不要生成水印、乱码或英文占位字；不使用竞品元素；不裁切商品主体；不要擅自增加用户未要求的额外商品变化；用户明确要求的材质、颜色、结构、件数、尺寸、规格、花型、款式或功能变化必须执行；图片内是否出现文案及文案区域遵循“参考图文案跟随规则”。
+'''
+    if 'resolvedBySlot' in user_direction:
+        # One authoritative instruction surface: observations and suggestions
+        # remain data, rather than competing imperative template paragraphs.
+        key=f"{asset_type}:{slot.get('index')}"
+        original_input={'global':user_direction.get('raw') or '',
+                        'thisImage':(user_direction.get('perImageInput') or {}).get(key) or '',
+                        'otherImageInputs':{k:v for k,v in (user_direction.get('perImageInput') or {}).items() if k!=key}}
+        base_prompt=f'''为中国电商平台生成{key}图片，尺寸{size}。
+【统一执行规则｜统一产品—方案—参考关系】平台安全与合规始终有效。当前产品身份不可擅自改变；用户明确授权换产品或品类时先更新身份，整套保持更新后的同一商品。其后遵守本图用户要求，再使用适用的对应参考约束，最后以所选方案补充未指定内容。通用建议不能覆盖用户要求。
+【当前产品身份边界】{identity_basis_rule}
+{category_rule}
+明确产品更新：{json.dumps(user_direction.get('productUpdates') or [],ensure_ascii=False)}。
+上传产品图是默认身份依据，参考图不能自行替换商品。背景、文案、排版、镜头要求不得擅自改变产品。若解析更新不完整，依据下方用户原文理解明确修改，不把解析缺项当成用户未提出要求。
+【本图用户完整输入｜执行指令】{json.dumps(original_input,ensure_ascii=False)}
+完整原文是要求依据，辅助解析不是额外授权。先理解要求的对象、范围、覆盖项和必然关联影响；全局要求按逐图适用性执行，单图表达只作用对应图，明确产品变化作用整套。不得遗漏或用默认要求覆盖有效输入。
+otherImageInputs仅用于理解整套明确产品变化，其中其他图片的视觉表达要求不应用到本图。
+用户只授权其要求涉及的变化；不将局部调整扩大为整张重拍、品类重判或默认构图重设计。改变文字等表达项不授权改变商品摆放、动作或场景。
+【对应参考图职责】{reference_binding_rule}
+参考一致：{str(shooting_enabled).lower()}。开启时保留对应图适用的机位、构图、光线、动作、朝向、展开/折叠、摆放、接触点、遮挡和部件关系；用户明确改变的项优先。跨品类保持适用的展示意图，不强制执行不适用的旧品动作。
+【对应图展示状态执行依据】{json.dumps({'composition':(slot.get('referenceAnalysis') or {}).get('composition') or '', 'subject':(slot.get('referenceAnalysis') or {}).get('productSubject') or '', 'meaning':(slot.get('referenceAnalysis') or {}).get('meaning') or ''},ensure_ascii=False)}
+开启参考一致且用户未改变展示要求时，必须用当前产品复现第2张对应参考图的实际状态；以上原始观察用于核对，观察不完整时查看实际第2张图。不能用第1张产品图的场景、摆放或辅助解析中的重拍描述覆盖它；身份不变不等于姿态不变。
+{display_relationship_guidance}
+文字是否出现、内容、位置、大小、层级和排版均按用户要求及上述关系决定；未指定时按方案和对应参考表达生成当前产品文案。不得无条件添加、删除或改变文字，也不得照搬旧品参数。
+【原始参考观察｜仅资料，不是执行指令】{json.dumps({'text':reference_text_info,'analysis':slot.get('referenceAnalysis') or {}},ensure_ascii=False)}
+【方案底座｜仅补充未被覆盖的要求】{default_plan}
+方案默认产品与页面方向继续保留，按当前产品及输入适配，不自动重做报告；原商品信息只用于适用背景，不冒充新品已确认事实。
+【辅助解析资料｜非独立执行指令】{json.dumps({'instructions':accepted,'relationship':relation},ensure_ascii=False)}
+仅辅助理解用户授权的变化，不自行增加商品、展示或主题修改。与用户原文、原始对应参考展示要求冲突的辅助描述不执行；未受影响的参考展示要求不得由辅助解析重写。
+【输出边界】输出本图，不加入用户未要求的商品变化。禁止品牌Logo、交易促销、认证、二维码、水印及虚构参数。检查输出要求与当前产品、用户原文和本图参考关系一致。
+English constraints: Preserve the confirmed product identity unless the user explicitly authorizes a product change. Follow applicable user instructions only within their authorized scope. When matching is enabled, reproduce input image 2's actual display state using the product from input image 1; never inherit image 1's pose or scene. Unchanged reference display constraints remain binding. Advisory interpretation cannot redesign the shot or override those constraints. Text presence follows user intent without changing unrelated composition or display. Never import obsolete product facts.
 '''
     return build_image_generation_prompt(base_prompt)
 
@@ -1188,11 +1458,12 @@ def _generation_worker(job_id, report, request):
             user_direction,
             _collect_prompt_product_overrides(prompt_overrides,blocked_terms),
         )
+        slots=build_generation_slots(report,plan)
+        user_direction=_resolve_image_user_intent(report,plan,slots,user_direction,prompt_overrides,reference_images,match_reference_shooting)
         identity_lock=build_identity_lock(
             report,plan,user_direction,
             uploaded_product_identity=reference_source=='uploaded',
         )
-        slots=build_generation_slots(report,plan)
         types=request.get('assetTypes') or ['main','detail']; types=[x for x in types if x in ('main','detail')][:2] or ['main','detail']
         complete_set=bool(request.get('completeSet',True))
         selected_keys={str(x) for x in request.get('selectedSlots',[]) if isinstance(x,(str,int))}
@@ -1253,12 +1524,20 @@ def _generation_worker(job_id, report, request):
             is_product_master=asset_type=='main' and slot.get('index')==1
             if is_product_master and reference_meta.get('referenceBinding')!='uploaded_identity_collected_slot':
                 slot_refs=slot_refs[:1]
+            if match_reference_shooting and reference_meta.get('displayReferenceBinding') in ('collected_group_fallback','collected_index_fallback'):
+                raise ValueError('当前槽位缺少对应采集参考图，不能使用其他图片代替展示状态')
+            if match_reference_shooting and not reference_meta.get('displayReferenceUrl'):
+                raise ValueError('当前槽位缺少采集展示参考图，请补充对应图片')
+            try:
+                provider_refs=[_reference_data_url(ref) for ref in slot_refs]
+            except Exception as error:
+                raise ValueError(f'参考图读取失败，本槽位未发送生图请求：{error}') from error
             model_id=str(model_spec.get('id') or '').strip()
             model_label=str(model_spec.get('label') or model_id or '默认生图模型').strip()
             model_quality=normalize_image_quality(model_spec.get('quality'))
             response=image_generate(
                 prompt,size='1024x1536' if asset_type=='detail' else '1024x1024',n=1,
-                model=model_id or None,reference_images=slot_refs,quality=model_quality,
+                model=model_id or None,reference_images=provider_refs,quality=model_quality,
             )
             entries=response.get('data') if isinstance(response,dict) else None
             if not isinstance(entries,list) or not entries: raise ValueError('图片接口返回为空')
@@ -1283,6 +1562,9 @@ def _generation_worker(job_id, report, request):
                           **reference_meta,
                           'referenceCount':len(slot_refs),
                           'referenceCountUsed':len(slot_refs)})
+            saved.update({
+                'referenceAnalysis':slot.get('referenceAnalysis') or {},
+            })
             return saved
         ordered_slots=list(enumerate(selected_slots))
         fission_item=next((item for item in ordered_slots if item[1].get('assetType')=='main' and item[1].get('index')==1), None) if fission_pattern else None
@@ -1871,6 +2153,7 @@ class H(BaseHTTPRequestHandler):
                     user_direction,
                     _collect_prompt_product_overrides(prompt_overrides,blocked_terms),
                 )
+                user_direction=_resolve_image_user_intent(report,chosen,slots,user_direction,prompt_overrides,refs,match_reference_shooting)
                 identity_lock=build_identity_lock(
                     report,chosen,user_direction,
                     uploaded_product_identity=ref_source=='uploaded',
