@@ -1,5 +1,4 @@
 import base64, json, os, re, ssl, time, uuid, urllib.request, urllib.error
-from urllib.parse import urlparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -237,8 +236,13 @@ def image_generate(prompt, size='1024x1024', n=1, model=None, reference_images=N
     refs=[str(x).strip() for x in (reference_images or []) if str(x).strip()]
     if len(refs)>4:
         raise ValueError('单次生图最多四张参考图，不能静默丢弃输入')
-    edit_request=bool(refs and image_model.startswith('gpt-image-') and (
-        urlparse(c['api_base']).hostname in ('api.apiyi.com','api.openai.com') or path.rstrip('/').endswith('/images/edits')
+    # GPT Image reference inputs belong to the image-edit contract regardless
+    # of which OpenAI-compatible gateway hosts the model. Sending guessed JSON
+    # fields to /images/generations can succeed while the gateway silently
+    # ignores every reference image, producing an ungrounded text-to-image
+    # result. Use multipart /images/edits whenever a gpt-image model has refs.
+    edit_request=bool(refs and (
+        image_model.startswith('gpt-image-') or path.rstrip('/').endswith('/images/edits')
     ))
     if edit_request and path.rstrip('/').endswith('/images/generations'):
         path=path.rstrip('/')[:-len('generations')]+'edits'

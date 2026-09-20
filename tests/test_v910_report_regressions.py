@@ -1,4 +1,4 @@
-import sys, unittest
+import sys, unittest, json, base64
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'server'))
@@ -57,5 +57,36 @@ class V910RegressionTest(unittest.TestCase):
             self.assertEqual('https://img.example.com/a.jpg',meta['sourceUrl'])
             self.assertTrue(meta['localUrl'].startswith('/reports/assets/task1/main/'))
             self.assertTrue(list((Path(td)/'task1'/'main').glob('IMG_MAIN_0001.*')))
+
+    def test_offline_report_embeds_images_and_restores_local_cache(self):
+        result=self.base_result()
+        result['evidenceLedger']=[{'id':'IMG_MAIN_0001','type':'image','value':'https://img.example.com/a.jpg','meta':{'group':'main','cacheStatus':'failed'}}]
+        image=b'\xff\xd8\xffFAKEJPEG'
+        with tempfile.TemporaryDirectory() as td:
+            reports=Path(td)
+            (reports/'test.json').write_text(json.dumps(result,ensure_ascii=False),'utf-8')
+            with patch.object(server_module,'REPORTS',reports), \
+                 patch.object(server_module,'IMAGE_ASSET_ROOT',reports/'assets'), \
+                 patch.object(server_module,'_download_image',return_value=(image,'image/jpeg')) as download:
+                document=server_module.build_offline_report('test').decode('utf-8')
+            download.assert_called_once()
+            self.assertIn('data:image/jpeg;base64,'+base64.b64encode(image).decode('ascii'),document)
+            self.assertIn('window.OFFLINE_REPORT=true',document)
+            self.assertNotIn('href="/report.css',document)
+            self.assertNotIn('src="/report.js',document)
+            saved=json.loads((reports/'test.json').read_text('utf-8'))
+            self.assertTrue(saved['evidenceLedger'][0]['meta']['localUrl'].startswith('/reports/assets/test/main/'))
+
+    def test_offline_report_rejects_missing_images(self):
+        result=self.base_result()
+        result['evidenceLedger']=[{'id':'IMG_MAIN_0001','type':'image','value':'https://img.example.com/missing.jpg','meta':{'group':'main'}}]
+        with tempfile.TemporaryDirectory() as td:
+            reports=Path(td)
+            (reports/'test.json').write_text(json.dumps(result,ensure_ascii=False),'utf-8')
+            with patch.object(server_module,'REPORTS',reports), \
+                 patch.object(server_module,'IMAGE_ASSET_ROOT',reports/'assets'), \
+                 patch.object(server_module,'_download_image',side_effect=OSError('offline')):
+                with self.assertRaisesRegex(ValueError,'1 张报告图片未能下载'):
+                    server_module.build_offline_report('test')
 
 if __name__=='__main__':unittest.main()

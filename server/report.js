@@ -335,6 +335,8 @@ function initHeroCarousel() {
   show(0); start();
 }
 function initPlanActions(plans, context={}) {
+  // task-final-prompt is intentionally not rendered in the task card; prompts
+  // remain an internal generation detail while per-image editing stays available.
   const dialog = document.querySelector('#quick-plan-dialog');
   if (!dialog) return;
   const title = dialog.querySelector('[data-plan-title]'), reason = dialog.querySelector('[data-plan-reason]');
@@ -352,12 +354,13 @@ function initPlanActions(plans, context={}) {
   const referenceInput=dialog.querySelector('[data-reference-input]');
   const referenceList=dialog.querySelector('[data-reference-list]');
   const referenceHint=dialog.querySelector('[data-reference-hint]');
-  let uploadedReferences=[];
+  let uploadedReferences=[], pendingReferenceUploads=0;
   if (generateButton) { generateButton.textContent='正在计算生成数量…'; generateButton.disabled=true; }
   let activePlanIndex=0, previewSlots=[], selectedSlotKeys=new Set(), promptOverrides={};
   let retainedResults=[], generatedTaskSlots=[];
   let imageModelOptions=[], selectedImageModels=new Set(), selectedImageQualities=new Map(), imageModelPromise=null;
-  let submittedModelSpecs=[];
+  const lastJobStorageKey=`sansong:last-image-job:${context.source||'embedded'}:${activePlanIndex}`;
+  let submittedModelSpecs=[], lastSubmittedJobId=localStorage.getItem(lastJobStorageKey)||'';
   const slotKey=slot=>`${slot.assetType}:${slot.index}`;
   const mergeResults=(older,newer)=>{
     const resultKey=item=>`${item.modelKey||item.model||'default'}:${item.assetType}:${item.slotIndex}`;
@@ -507,17 +510,22 @@ function initPlanActions(plans, context={}) {
     const mergeNote=mergeMode==='applied'?'本图已关联并优先融合本图编辑':
       hasGlobalAccepted?'本图已关联并优先融合全局用户要求':
       mergeMode==='ignored_unrelated'||hasGlobalIgnored||hasGlobalRejected?'本图未关联或存在不可执行要求，继续执行内置策划':
-      '本图执行内置策划';
+      hasUserEdit||userDirection()?'提交后解析用户要求并组装提示词':'提交后组装本图提示词';
     const planContext=compact([slot.planProductAction,slot.planPageAction]);
     const planContextHtml=planContext?`<p class="generation-plan-context"><b>${esc(slot.planName||'当前开品方案')}</b> · ${esc(planContext)}</p>`:'';
-      const media=result?.url?`<button class="generation-preview-btn" type="button" data-preview-url="${esc(result.url)}" data-preview-title="${esc(taskName(slot))}"><img loading="lazy" src="${esc(result.url)}" alt="${esc(taskName(slot))}"></button>`:`<div class="generation-task-placeholder"><span>${slot.assetType==='detail'?'DETAIL':'MAIN'}</span><b>${String(slot.index||1).padStart(2,'0')}</b></div>`;
-    const referencePreview=slot.displayReferenceUrl||slot.identityReferenceUrl;
-    const referenceLabel=slot.displayReferenceUrl?'展示状态参考图':'产品身份参考图';
-    const referenceThumb=referencePreview?`<div class="generation-reference-preview"><img loading="lazy" src="${esc(referencePreview)}" alt="${esc(referenceLabel)}"><span>${esc(referenceLabel)}</span></div>`:'';
+    const showDisplayReference=matchReferenceShooting();
+    const referencePreview=showDisplayReference?(slot.displayReferenceUrl||''):'';
+    const referenceLabel='对应采集展示参考图';
+    const stateMedia=result?.url
+      ? `<button class="generation-preview-btn generation-result-main" type="button" data-preview-url="${esc(result.url)}" data-preview-title="${esc(taskName(slot))}"><img loading="lazy" src="${esc(result.url)}" alt="${esc(taskName(slot))}"><span>生成结果</span></button>`
+      : referencePreview
+        ? `<div class="generation-reference-main"><img loading="lazy" src="${esc(referencePreview)}" alt="${esc(referenceLabel)}"><span>${esc(referenceLabel)}</span></div>`
+        : `<div class="generation-task-placeholder"><span>${status==='error'?'FAILED':status==='generating'?'RUNNING':'待生成'}</span><b>${String(slot.index||1).padStart(2,'0')}</b></div>`;
+    const media=`<div class="generation-task-state-media">${stateMedia}</div>`;
     const resultSpec=result?`<small class="generation-task-spec">${esc(modelLabel(result))} · 质量 ${esc(modelQuality(result))}</small>`:'';
     const visibleResultSpec=result?`<div class="generation-task-result-meta"><b>本次实际请求</b>${resultSpec}</div>`:'';
     const choose=status==='queued'?`<label class="generation-slot-select"><input type="checkbox" data-select-slot="${esc(key)}" ${selectedSlotKeys.has(key)?'checked':''}><span>生成此图</span></label>`:'';
-    return `<article class="generation-task-card generation-task-${status} ${selectedSlotKeys.has(key)?'is-selected':''}" data-task-card="${esc(key)}"><div class="generation-task-media">${media}<i>${esc(label)}</i><div class="generation-task-overlay"><small>${slot.assetType==='detail'?'详情图':'主图'} ${String(slot.index||1).padStart(2,'0')}</small><h4>${esc(taskName(slot))}</h4>${planContextHtml}${resultSpec}${arr(slot.task).length?`<p>${arr(slot.task).map(esc).join(' · ')}</p>`:''}<p class="generation-prompt-status">${esc(mergeNote)}</p>${choose}<details class="task-prompt"><summary>编辑本张提示词</summary><em>商品材质、颜色、结构等修改会同步整套图片；视觉要求仅在关联本图时融合。</em><textarea data-prompt-slot="${esc(key)}" placeholder="例如：改成天丝棉材质；或背景留白更大、改为面料微距特写">${esc(promptText)}</textarea><details class="task-final-prompt"><summary>查看最终提示词</summary><pre>${esc(slot.prompt||'')}</pre></details></details></div></div>${referenceThumb}${visibleResultSpec}</article>`;
+    return `<article class="generation-task-card generation-task-${status} ${selectedSlotKeys.has(key)?'is-selected':''}" data-task-card="${esc(key)}"><div class="generation-task-media">${media}<i>${esc(label)}</i></div><div class="generation-task-info"><small>${slot.assetType==='detail'?'详情图':'主图'} ${String(slot.index||1).padStart(2,'0')}</small><h4>${esc(taskName(slot))}</h4>${planContextHtml}${resultSpec}${arr(slot.task).length?`<p>${arr(slot.task).map(esc).join(' · ')}</p>`:''}<p class="generation-prompt-status">${esc(mergeNote)}</p>${choose}<details class="task-prompt"><summary>编辑本张要求</summary><em>商品材质、颜色、结构等修改会同步整套图片；视觉要求仅在关联本图时融合。</em><textarea data-prompt-slot="${esc(key)}" placeholder="例如：改成天丝棉材质；或背景留白更大、改为面料微距特写">${esc(promptText)}</textarea></details></div>${visibleResultSpec}</article>`;
   };
   const openPreview=button=>{
     const buttons=[...generateResults.querySelectorAll('[data-preview-url]')];
@@ -545,9 +553,9 @@ function initPlanActions(plans, context={}) {
         const choose=jobStatus==='queued'
           ? `<label class="generation-slot-select"><input type="checkbox" data-select-slot="${esc(slotKeyValue)}" ${selectedSlotKeys.has(slotKeyValue)?'checked':''}><span>生成此图</span></label>`
           : '';
-        const ref=slot.displayReferenceUrl||slot.identityReferenceUrl;
-        const refLabel=slot.displayReferenceUrl?'展示状态参考图':'产品身份参考图';
-        const refThumb=ref?`<div class="generation-reference-preview"><img loading="lazy" src="${esc(ref)}" alt="${esc(refLabel)}"><span>${esc(refLabel)}</span></div>`:'';
+        const refItems=[];
+        if (matchReferenceShooting() && slot.displayReferenceUrl) refItems.push(['采集展示参考图',slot.displayReferenceUrl]);
+        const refThumb=refItems.length?`<div class="generation-reference-previews"><b>确认前参考图</b><div>${refItems.map(([label,url])=>`<figure class="generation-reference-preview"><img loading="lazy" src="${esc(url)}" alt="${esc(label)}"><figcaption>${esc(label)}</figcaption></figure>`).join('')}</div></div>`:'<div class="generation-reference-empty">确认前暂无可用参考图</div>';
         const planContext=compact([slot.planProductAction,slot.planPageAction]);
         const planContextHtml=planContext?`<span class="generation-plan-context"><b>${esc(slot.planName||'当前开品方案')}</b> · ${esc(planContext)}</span>`:'';
         const taskCell=`<div class="generation-comparison-task"><small>${slot.assetType==='detail'?'详情图':'主图'} ${String(slot.index||1).padStart(2,'0')}</small><strong>${esc(taskName(slot))}</strong>${planContextHtml}${refThumb}${choose}</div>`;
@@ -591,8 +599,8 @@ function initPlanActions(plans, context={}) {
     const requestTotal=total*modelCount;
     // Keep the count calculation in one place; the single-model label follows the modal spec.
     // 兼容旧版校验：确认生成：${countText(counts)}
-    if (generateButton) { generateButton.disabled=!total||!selectedImageModels.size; generateButton.textContent=requestTotal?(modelCount>1?`${modelCount} 个模型 × ${countText(counts)} = ${requestTotal} 张`:`确认生成：${countText(counts)}`):'请选择要生成的图片类型'; }
-    if (generateStatus && previewSlots.length) generateStatus.textContent=requestTotal?`本次计划生成 ${countText(counts)}；${modelCount>1?`将按 ${modelCount} 个模型并排对比，共 `:''} ${requestTotal} 张。${fissionEnabled()&&counts.main?'裂变模式已计入 main:1 基准图。':''}${modelCount>1?'多模型对比使用同一参考图和同一份提示词。':''}点击按钮后还需确认。`:'请至少选择一种图片类型和一个生图模型。';
+    if (generateButton) { generateButton.disabled=!total||!selectedImageModels.size||pendingReferenceUploads>0; generateButton.textContent=pendingReferenceUploads?'正在上传参考图…':requestTotal?(modelCount>1?`${modelCount} 个模型 × ${countText(counts)} = ${requestTotal} 张`:`确认生成：${countText(counts)}`):'请选择要生成的图片类型'; }
+    if (generateStatus && previewSlots.length) generateStatus.textContent=requestTotal?`本次计划生成 ${countText(counts)}；${modelCount>1?`将按 ${modelCount} 个模型并排对比，共 `:''}${requestTotal} 张。${fissionEnabled()&&counts.main?'裂变基准图 main:1 已计入主图数量。':''}积分：此 Demo 未接入计费。编辑要求不会调用 AI；确认提交后后台解析。`:'请至少选择一种图片类型和一个生图模型。';
     syncTypeSwitches();
     if (previewSlots.length) renderTaskBoard(previewSlots);
   };
@@ -620,26 +628,11 @@ function initPlanActions(plans, context={}) {
     else selectedSlotKeys.add(card.dataset.taskCard);
     refreshGenerationConfirmation();
   });
-  const refreshPromptPreview=()=>{
-    if (!previewSlots.length) return Promise.resolve();
-    const previewBody={planIndex:activePlanIndex,assetTypes:['main','detail'],referenceImages:uploadedReferences,userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides};
-    if (context.source) previewBody.source=context.source; else if (context.data) previewBody.reportData=context.data;
-    return fetch('/api/image-prompt-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(previewBody)}).then(response=>readJsonResponse(response,'/api/image-prompt-preview')).then(payload=>{
-      if (!payload.ok) throw new Error(payload.error||'提示词融合失败');
-      const promptIndexes={main:0,detail:0};
-      previewSlots=arr(payload.slots).map(slot=>{
-        const index=promptIndexes[slot.assetType]++;
-        const key=`${slot.assetType}:${slot.index}`;
-        return {...slot,prompt:arr(payload.prompts?.[slot.assetType])[index]||'',promptMerge:payload.promptMerges?.[key],userDirection:payload.userDirectionBySlot?.[key]};
-      });
-      if (generateStatus && payload.userDirection?.raw) generateStatus.textContent=directionNote(payload.userDirection);
-    });
-  };
   generateResults?.addEventListener('change',event=>{
     const textarea=event.target.closest('[data-prompt-slot]');
     if (textarea) {
       promptOverrides[textarea.dataset.promptSlot]=textarea.value;
-      refreshPromptPreview().then(refreshGenerationConfirmation).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'提示词融合失败';});
+      refreshGenerationConfirmation();
       return;
     }
     const input=event.target.closest('[data-select-slot]');
@@ -704,12 +697,13 @@ function initPlanActions(plans, context={}) {
       if (state.status==='complete') { const gate=state.consistencyGate||{}; const shootPolicy=state.matchReferenceShooting?'已按参考图拍摄与产品展示状态生成。':'按每张图片任务重新设计拍摄和展示状态。'; const failedSlots=arr(state.failedSlots), failed=failedSlots.length; retainedResults=displayResults; if(failed){selectedSlotKeys=new Set(failedSlots.map(item=>`${item.assetType}:${item.slotIndex}`));const counts=generationCounts();if(generateButton){generateButton.disabled=false;generateButton.textContent=`仅重试失败：${countText(counts)}`;}syncTypeSwitches();} if(generateStatus) generateStatus.textContent=failed?`部分完成：累计成功 ${displayResults.length} 张，失败 ${failed} 张。点击按钮仅重试失败槽位。`:`已生成 ${displayResults.length} 张图片。${shootPolicy}${gate.status==='passed'?'一致性校验通过。':'已共享产品身份锁，发布前仍需完成一致性复核。'}`; renderTaskBoard(boardSlots,displayResults,'complete',failedSlots); return; }
       if (state.status==='error') { renderTaskBoard(boardSlots,displayResults,'error',state.failedSlots); throw new Error(state.error||'生图失败'); }
       renderTaskBoard(boardSlots,displayResults,'running',state.failedSlots);
-      const counts=generationCounts(); const expectedTotal=(counts.main+counts.detail)*Math.max(1,selectedImageModels.size); if (generateStatus) generateStatus.textContent=`正在并发生成：已完成 ${arr(state.results).length} / ${expectedTotal} 张 · ${state.progress||0}%`;
+      const counts=generationCounts(); const expectedTotal=(counts.main+counts.detail)*Math.max(1,selectedImageModels.size); if (generateStatus) generateStatus.textContent=state.status==='queued'||state.status==='preparing'?'任务已提交，正在准备；可关闭页面，稍后在生成记录中查看。':`正在并发生成：已完成 ${arr(state.results).length} / ${expectedTotal} 张 · ${state.progress||0}%`;
       await new Promise(resolve=>setTimeout(resolve,1200));
     }
     throw new Error('生图任务等待超时，请稍后刷新报告查看结果。');
   };
   generateButton?.addEventListener('click',async event=>{
+    if (pendingReferenceUploads) return;
     ensureFissionBaseSelected();
     const types=selectedTypes(), counts=generationCounts(), total=counts.main+counts.detail;
     if (!types.length) { if(generateStatus) generateStatus.textContent='至少选择主图或详情图一种类型。'; return; }
@@ -718,7 +712,7 @@ function initPlanActions(plans, context={}) {
     submittedModelSpecs=modelSpecs.map(item=>({...item}));
     renderGenerationRunSummary('running',submittedModelSpecs);
     const modelSummary=modelSpecs.map(item=>`${item.label||item.id}（${modelQuality(item)}）`).join('、');
-    if (!window.confirm(`确认开始生成？\n\n模型：${modelSummary}\n主图：${counts.main} 张\n详情图：${counts.detail} 张\n合计：${requestTotal} 张`)) {
+    if (!window.confirm(`确认开始生成？\n\n模型：${modelSummary}\n主图：${counts.main} 张${fissionEnabled()&&counts.main?'（含裂变基准图 main:1）':''}\n详情图：${counts.detail} 张\n合计：${requestTotal} 张\n积分：此 Demo 未接入计费`)) {
       renderGenerationRunSummary('queued',[]);
       if (generateStatus) generateStatus.textContent=`已取消。本次原计划生成 ${modelSpecs.length} 个模型 × ${countText(counts)}。`;
       return;
@@ -726,10 +720,13 @@ function initPlanActions(plans, context={}) {
     const submittedSlots=previewSlots.filter(slot=>selectedSlotKeys.has(slotKey(slot)));
     event.currentTarget.disabled=true; if(generateStatus) generateStatus.textContent='正在提交生图任务…'; renderTaskBoard(submittedSlots,retainedResults,'running');
     try {
-      const body={planIndex:activePlanIndex,assetTypes:types,selectedSlots:[...selectedSlotKeys],completeSet:true,imageModels:modelSpecs.map(item=>({id:item.id,quality:item.quality||''})),referenceImages:uploadedReferences,userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides};
+      const body={planIndex:activePlanIndex,assetTypes:types,selectedSlots:[...selectedSlotKeys],completeSet:true,imageModels:modelSpecs.map(item=>({id:item.id,quality:item.quality||''})),referenceImages:[...uploadedReferences],userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides:{...promptOverrides},reuseAnalysisJobId:lastSubmittedJobId};
       if (context.source) body.source=context.source; else if (context.data) body.reportData=context.data;
       const response=await fetch('/api/generate-images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}), payload=await readJsonResponse(response,'/api/generate-images');
       if (!response.ok || !payload.ok) throw new Error(payload.error||'无法提交生图任务');
+      lastSubmittedJobId=payload.jobId;
+      localStorage.setItem(`sansong:last-image-job:${context.source||'embedded'}:${activePlanIndex}`,payload.jobId);
+      if (generateStatus) generateStatus.textContent='任务已提交，正在准备；可关闭页面，稍后在生成记录中查看。';
       window.dispatchEvent(new CustomEvent('image-job-submitted',{detail:{jobId:payload.jobId}}));
       await pollJob(payload.jobId);
       window.dispatchEvent(new CustomEvent('image-job-finished',{detail:{jobId:payload.jobId}}));
@@ -741,19 +738,28 @@ function initPlanActions(plans, context={}) {
   const referenceEmpty=dialog.querySelector('.reference-empty');
   const addReferenceFiles=async fileList=>{
     const files=[...fileList].slice(0,Math.max(0,4-uploadedReferences.length));
+    let uploadError='';
     for (const file of files) {
       if (!file.type.startsWith('image/')) continue;
       if (file.size>9*1024*1024) { if(generateStatus) generateStatus.textContent='单张参考图不能超过 9MB。'; continue; }
+      pendingReferenceUploads++;
+      refreshGenerationConfirmation();
       try {
         const dataUrl=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(file)});
-        uploadedReferences.push(dataUrl);
-      } catch (_) {
-        if (generateStatus) generateStatus.textContent='参考图读取失败，请重新选择图片。';
+        const response=await fetch('/api/image-reference-upload',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image:dataUrl})});
+        const payload=await readJsonResponse(response,'/api/image-reference-upload');
+        if (!response.ok||!payload.ok||!payload.url) throw new Error(payload.error||'参考图上传失败');
+        uploadedReferences.push(payload.url);
+      } catch (error) {
+        uploadError=error.message||'参考图上传失败，请重新选择图片。';
+      } finally {
+        pendingReferenceUploads--;
+        refreshGenerationConfirmation();
       }
     }
     renderReferences(arr(plans)[activePlanIndex]||{});
-    if (previewSlots.length) await refreshPromptPreview().then(refreshGenerationConfirmation).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'参考图提示词刷新失败';});
-    if(generateStatus) generateStatus.textContent=uploadedReferences.length?`已使用上传产品图；生成时会保持产品身份。${matchReferenceShooting()?' '+matchReferenceDescription():''}`:`将使用默认采集参考图。${matchReferenceShooting()?' '+matchReferenceDescription():''}`;
+    refreshGenerationConfirmation();
+    if(generateStatus) generateStatus.textContent=uploadError|| (uploadedReferences.length?`已使用上传产品图；生成时会保持产品身份。${matchReferenceShooting()?' '+matchReferenceDescription():''}`:`将使用默认采集参考图。${matchReferenceShooting()?' '+matchReferenceDescription():''}`);
   };
   referenceInput?.addEventListener('change',async event=>{
     await addReferenceFiles(event.target.files);
@@ -786,31 +792,23 @@ function initPlanActions(plans, context={}) {
     uploadedReferences.splice(Number(button.dataset.removeReference),1);
     if (!uploadedReferences.length&&fissionInput) fissionInput.checked=true;
     renderReferences(arr(plans)[activePlanIndex]||{});
-    if (previewSlots.length) refreshPromptPreview().then(refreshGenerationConfirmation).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'参考图提示词刷新失败';});
+    refreshGenerationConfirmation();
   });
   fissionInput?.addEventListener('change',()=>{
     renderReferences(arr(plans)[activePlanIndex]||{});
-    if (previewSlots.length) refreshPromptPreview().then(refreshGenerationConfirmation).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'裂变提示词刷新失败';});
+    refreshGenerationConfirmation();
   });
-  matchReferenceInput?.addEventListener('change',async()=>{
+  matchReferenceInput?.addEventListener('change',()=>{
     syncMatchReferenceControl(arr(plans)[activePlanIndex]||{});
     syncFissionControl();
-    if (!previewSlots.length) {
-      if (generateStatus) generateStatus.textContent=matchReferenceDescription();
-      return;
-    }
-    try {
-      await refreshPromptPreview();
-      refreshGenerationConfirmation();
-      if (generateStatus) generateStatus.textContent=matchReferenceDescription();
-    } catch(error) {
-      if (generateStatus) generateStatus.textContent=error.message||'参考图拍摄方式提示词刷新失败';
-    }
+    refreshGenerationConfirmation();
+    if (generateStatus) generateStatus.textContent=matchReferenceDescription();
   });
   document.querySelectorAll('.generate-plan-btn').forEach(button=>button.addEventListener('click',()=>{
     loadImageModels();
     const plan = arr(plans)[Number(button.dataset.planIndex)] || {};
     activePlanIndex=Number(button.dataset.planIndex)||0;
+    lastSubmittedJobId=localStorage.getItem(`sansong:last-image-job:${context.source||'embedded'}:${activePlanIndex}`)||'';
     if (userDirectionInput) userDirectionInput.value='';
     if (fissionInput) fissionInput.checked=true;
     if (matchReferenceInput) matchReferenceInput.checked=false;
@@ -822,44 +820,24 @@ function initPlanActions(plans, context={}) {
     title.textContent = plan.name || '快速开品方案';
     if (reason) { reason.textContent = plan.whyThisPlan || ''; reason.hidden = !hasContent(plan.whyThisPlan); }
     [[product,plan.productAction],[page,plan.pageAction],[validation,plan.validation]].forEach(([node,value])=>{if(!node)return;node.textContent=value||'';node.closest('div').hidden=!hasContent(value)});
-    if (generateStatus) generateStatus.textContent='已按此方案准备生图提示词。请先选择要生成的图片类型。';
+    if (generateStatus) generateStatus.textContent='正在加载默认图片任务；编辑阶段不会调用 AI。';
     if (generateResults) generateResults.replaceChildren();
-    const previewBody={planIndex:activePlanIndex,assetTypes:['main','detail'],referenceImages:uploadedReferences,userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides};
-    if (context.source) previewBody.source=context.source; else if (context.data) previewBody.reportData=context.data;
-    fetch('/api/image-prompt-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(previewBody)}).then(response=>readJsonResponse(response,'/api/image-prompt-preview')).then(payload=>{
-      if (!payload.ok) throw new Error(payload.error||'提示词预览失败');
-      const promptIndexes={main:0,detail:0};
-      previewSlots=arr(payload.slots).map(slot=>{
-        const index=promptIndexes[slot.assetType]++;
-        const key=`${slot.assetType}:${slot.index}`;
-        return {...slot,prompt:arr(payload.prompts?.[slot.assetType])[index]||'',promptMerge:payload.promptMerges?.[key],userDirection:payload.userDirectionBySlot?.[key]};
-      });
+    const setupBody={planIndex:activePlanIndex,referenceImages:[...uploadedReferences],matchReferenceShooting:!!matchReferenceInput?.checked,fissionPattern:fissionEnabled()};
+    if (context.source) setupBody.source=context.source; else if (context.data) setupBody.reportData=context.data;
+    fetch('/api/image-generation-setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(setupBody)}).then(response=>readJsonResponse(response,'/api/image-generation-setup')).then(payload=>{
+      if (!payload.ok) throw new Error(payload.error||'默认图片任务加载失败');
+      previewSlots=arr(payload.slots);
       // 默认保留完整主图链和前六个详情证明位；详情 7-15 可按需勾选。
       selectedSlotKeys=new Set(previewSlots.filter(slot=>slot.assetType==='main'||slot.index<=6).map(slotKey));
       refreshGenerationConfirmation();
     }).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'生成数量计算失败，请重新打开方案。'});
     if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open','');
   }));
-  userDirectionInput?.addEventListener('change',()=>{
-    if (!previewSlots.length) return;
-    const previewBody={planIndex:activePlanIndex,assetTypes:['main','detail'],referenceImages:uploadedReferences,userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides};
-    if (context.source) previewBody.source=context.source; else if (context.data) previewBody.reportData=context.data;
-    fetch('/api/image-prompt-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(previewBody)}).then(response=>readJsonResponse(response,'/api/image-prompt-preview')).then(payload=>{
-      if (!payload.ok) throw new Error(payload.error||'用户补充判断失败');
-      const promptIndexes={main:0,detail:0};
-      previewSlots=arr(payload.slots).map(slot=>{
-        const index=promptIndexes[slot.assetType]++;
-        const key=`${slot.assetType}:${slot.index}`;
-        return {...slot,prompt:arr(payload.prompts?.[slot.assetType])[index]||'',promptMerge:payload.promptMerges?.[key],userDirection:payload.userDirectionBySlot?.[key]};
-      });
-      refreshGenerationConfirmation();
-      if (generateStatus && payload.userDirection?.raw) generateStatus.textContent=directionNote(payload.userDirection);
-    }).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'用户补充判断失败';});
-  });
+  userDirectionInput?.addEventListener('change',refreshGenerationConfirmation);
   dialog.querySelector('[data-close-plan]')?.addEventListener('click',()=>dialog.close ? dialog.close() : dialog.removeAttribute('open'));
   loadImageModels();
 }
-function openImagePreview(items,startIndex=0) {
+function openImagePreview(items,startIndex=0,openRevision=false,returnDialog=null) {
   const list=arr(items).filter(item=>item?.url);
   if (!list.length) return;
   let index=Math.max(0,Math.min(startIndex,list.length-1));
@@ -868,23 +846,81 @@ function openImagePreview(items,startIndex=0) {
     dialog=document.createElement('dialog');
     dialog.className='image-preview-dialog';
     dialog.setAttribute('data-image-preview-dialog','');
-    dialog.innerHTML='<button class="image-preview-close" type="button" data-preview-close aria-label="关闭">×</button><button class="image-preview-nav image-preview-prev" type="button" data-preview-prev aria-label="上一张">‹</button><figure><img data-preview-image alt=""><figcaption><b data-preview-title></b><span data-preview-count></span></figcaption></figure><button class="image-preview-nav image-preview-next" type="button" data-preview-next aria-label="下一张">›</button>';
+    dialog.innerHTML='<button class="image-preview-close" type="button" data-preview-close aria-label="关闭">×</button><div class="image-preview-version-bar"><button type="button" data-preview-prev aria-label="上一版本">‹</button><strong data-preview-version-label>版本 1 / 1</strong><button type="button" data-preview-next aria-label="下一版本">›</button><button type="button" class="image-preview-revision-btn" data-preview-revision>重新生成</button></div><div class="image-preview-layout"><aside class="image-preview-references"><b>对应参考图</b><div data-preview-references></div></aside><figure><img data-preview-image alt=""><figcaption><div><b data-preview-title></b><small data-preview-state></small></div><span data-preview-count></span></figcaption></figure></div><section class="image-preview-revision-panel" data-preview-revision-panel hidden><header><b>重新生成当前图片</b><button type="button" data-preview-revision-cancel>取消</button></header><p>这是重新生成，不是图片编辑。会沿用原任务的产品身份、参考图和方案，只修改你这次明确补充的要求。</p><p class="image-preview-current-mode" data-preview-mode></p><textarea data-preview-revision-input rows="4" placeholder="例如：背景留白更大；材质改成哑光；保持当前产品身份和对应展示状态"></textarea><button type="button" class="image-preview-revision-submit" data-preview-revision-submit>确认重新生成</button><small data-preview-revision-status></small></section>';
     document.body.append(dialog);
     dialog.addEventListener('click',event=>{if(event.target===dialog||event.target.closest('[data-preview-close]')) dialog.close();});
     dialog.addEventListener('keydown',event=>{if(event.key==='ArrowLeft'){event.preventDefault();dialog.querySelector('[data-preview-prev]')?.click();}if(event.key==='ArrowRight'){event.preventDefault();dialog.querySelector('[data-preview-next]')?.click();}});
+    dialog.addEventListener('close',()=>{
+      const target=dialog._returnDialog;
+      dialog._returnDialog=null;
+      if (!target||target.open) return;
+      if (typeof target.showModal==='function') target.showModal(); else target.setAttribute('open','');
+    });
   }
+  dialog._returnDialog=returnDialog;
+  const revisionPanel=dialog.querySelector('[data-preview-revision-panel]');
+  const revisionInput=dialog.querySelector('[data-preview-revision-input]');
+  const revisionStatus=dialog.querySelector('[data-preview-revision-status]');
+  const revisionButton=dialog.querySelector('[data-preview-revision]');
   const render=()=>{
     const item=list[index]||list[0], img=dialog.querySelector('[data-preview-image]');
+    dialog.classList.toggle('has-reference',arr(item.referenceUrls).length>0);
     img.src=item.url; img.alt=item.title||'生成图片';
+    const references=dialog.querySelector('[data-preview-references]');
+    references.innerHTML=arr(item.referenceUrls).map(ref=>`<figure><img src="${esc(ref.url)}" alt="${esc(ref.label||'参考图')}"><figcaption>${esc(ref.label||'参考图')}</figcaption></figure>`).join('')||'<span>本条记录未保存参考图</span>';
     dialog.querySelector('[data-preview-title]').textContent=item.title||'生成图片';
+    const displayRevision=item.displayRevisionNumber||item.revisionNumber||index+1;
+    dialog.querySelector('[data-preview-state]').textContent=`当前版本 v${displayRevision} · 可重新生成`;
+    dialog.querySelector('[data-preview-mode]').textContent=`本次将沿用当前模式：${item.generationMode||'产品身份模式'}。重新生成只新增当前图片版本，不改变原版本。`;
     dialog.querySelector('[data-preview-count]').textContent=`${index+1} / ${list.length}`;
+    dialog.querySelector('[data-preview-version-label]').textContent=`版本 ${displayRevision} / ${list.length}`;
+    revisionButton.hidden=!item.resultId||!item.jobId;
+    if (revisionPanel && !revisionPanel.hidden) revisionInput?.focus();
   };
   dialog.querySelector('[data-preview-prev]').onclick=()=>{index=(index-1+list.length)%list.length;render();};
   dialog.querySelector('[data-preview-next]').onclick=()=>{index=(index+1)%list.length;render();};
+  dialog.querySelector('[data-preview-revision]').onclick=()=>{
+    if (!list[index]?.resultId) return;
+    revisionPanel.hidden=false; revisionStatus.textContent=''; revisionInput.value=''; revisionInput.focus();
+  };
+  dialog.querySelector('[data-preview-revision-cancel]').onclick=()=>{revisionPanel.hidden=true;};
+  dialog.querySelector('[data-preview-revision-submit]').onclick=async()=>{
+    const item=list[index], reason=String(revisionInput?.value||'').trim();
+    if (!item?.resultId||!item?.jobId) return;
+    if (!window.confirm(`确认重新生成“${item.title||'当前图片'}”吗？\n\n${reason?'本次会合并你的补充要求。':'本次沿用已确认提示词。'}\n原版本不会被覆盖，会新增一个版本。`)) return;
+    const button=dialog.querySelector('[data-preview-revision-submit]'); button.disabled=true; revisionStatus.textContent='正在提交二次生成任务…';
+    try {
+      const overrides={...(item.promptOverrides||{})};
+      if (reason) overrides[item.taskKey]=reason;
+      const body={source:item.reportSource,planIndex:item.planIndex??0,assetTypes:[item.assetType],selectedSlots:[item.taskKey],completeSet:true,
+        revisionOfJobId:item.jobId,parentResultId:item.resultId,revisionReason:reason,referenceImages:arr(item.referenceImages),
+        matchReferenceShooting:!!item.matchReferenceShooting,fissionPattern:!!item.fissionPattern,userDirection:item.userDirection||'',
+        promptOverrides:overrides,imageModels:item.model?[{id:item.model,quality:item.quality||''}]:[]};
+      const response=await fetch('/api/generate-images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const payload=await readJsonResponse(response,'/api/generate-images');
+      if (!response.ok||!payload.ok) throw new Error(payload.error||'二次生成任务提交失败');
+      revisionStatus.textContent='任务已提交，正在生成；原版本已保留。';
+      button.disabled=false;
+      window.dispatchEvent(new CustomEvent('image-job-submitted',{detail:{jobId:payload.jobId,revisionOfJobId:item.jobId}}));
+      setTimeout(()=>{revisionPanel.hidden=true;},900);
+    } catch(error) { button.disabled=false; revisionStatus.textContent=error.message||'二次生成任务提交失败'; }
+  };
+  revisionPanel.hidden=true;
   render();
+  if (openRevision && !revisionButton.hidden) {
+    revisionStatus.textContent='';
+    revisionInput.value='';
+    revisionPanel.hidden=false;
+    revisionInput?.focus();
+  }
   if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open','');
 }
 function initGenerationHistory(context={}) {
+  // 兼容旧版任务状态文案：部分完成 · 失败 ${failedCount} 张
+  // 兼容旧版下载地址：/api/image-job/${encodeURIComponent(job.jobId)}/download
+  // 兼容旧版模型摘要：质量：${modelQuality(item)}
+  // 兼容旧版轮次标题来源：job.planName
+  // 兼容旧版参考策略文案：job.matchReferenceShooting?'已按参考图拍摄与展示状态一致'
   const root=document.querySelector('[data-generation-history]');
   if (!root) return;
   const endpoint='/api/image-jobs'+(context.source?'?source='+encodeURIComponent(context.source):'');
@@ -892,42 +928,150 @@ function initGenerationHistory(context={}) {
   const trigger=document.querySelector('[data-generation-history-open]');
   const countNode=document.querySelector('[data-generation-history-count]');
   let timer=null;
+  const setHistoryFullscreen=fullscreen=>{
+    if (!dialog) return;
+    dialog.classList.toggle('is-fullscreen',fullscreen);
+    const button=dialog.querySelector('[data-generation-history-fullscreen]');
+    button?.setAttribute('aria-pressed',String(fullscreen));
+    const label=button?.querySelector('[data-generation-history-fullscreen-label]');
+    if (label) label.textContent=fullscreen?'退出铺满':'铺满窗口';
+  };
   const openHistory=()=>{
+    setHistoryFullscreen(true);
     if (dialog && typeof dialog.showModal === 'function') dialog.showModal();
     else if (dialog) dialog.setAttribute('open','');
   };
   trigger?.addEventListener('click',openHistory);
+  const fullscreenButton=dialog?.querySelector('[data-generation-history-fullscreen]');
+  fullscreenButton?.addEventListener('click',()=>{
+    setHistoryFullscreen(!dialog.classList.contains('is-fullscreen'));
+  });
   dialog?.addEventListener('click',event=>{
     if (event.target===dialog || event.target.closest('[data-generation-history-close]')) {
       if (typeof dialog.close === 'function') dialog.close();
       else dialog.removeAttribute('open');
     }
   });
-  const render=records=>{
-    const items=arr(records);
-    if (countNode) {
-      countNode.textContent=items.length>99?'99+':String(items.length);
-      countNode.hidden=!items.length;
+  const historyItem=(job,item)=>({
+    url:item.url,title:`${item.assetType==='detail'?'详情图':'主图'} ${String(item.slotIndex||'').padStart(2,'0')}`,
+    referenceUrls:job.matchReferenceShooting&&item.displayReferenceUrl?[{label:'采集展示参考图',url:item.displayReferenceUrl}]:[],
+    resultId:item.resultId||`${job.jobId}:${item.assetType}:${item.slotIndex}`,
+    jobId:job.jobId,taskKey:item.taskKey||`${item.assetType}:${item.slotIndex}`,assetType:item.assetType,slotIndex:item.slotIndex,
+    revisionNumber:Number(item.revisionNumber||job.revisionNumber||1),rootResultId:item.rootResultId||job.rootResultIds?.[item.taskKey||`${item.assetType}:${item.slotIndex}`]||job.jobId,
+    generationRoundId:item.generationRoundId||job.generationRoundId||job.roundId||job.jobId,
+    roundType:item.roundType||job.roundType||(job.revisionOfJobId?'revision':'initial'),
+    revisionReason:item.revisionReason||job.revisionReason||'',
+    reportSource:job.reportSource||context.source||'',planIndex:job.planIndex??0,referenceImages:arr(job.referenceImages),
+    matchReferenceShooting:!!job.matchReferenceShooting,fissionPattern:!!job.fissionPattern,userDirection:job.userDirection||'',
+    generationMode:job.matchReferenceShooting?'产品图身份 + 采集参考图展示状态':job.fissionPattern?'产品图身份 + 裂变基准图':'产品图身份',
+    promptOverrides:job.promptOverrides||{},model:item.model||'',modelKey:item.modelKey||item.model||'default',quality:item.quality||'',
+    createdAt:Number(item.createdAt||job.completedAt||job.createdAt||0)
+  });
+  const roundKeyFor=(job,jobMap)=>{
+    if (job?.generationRoundId) return `round:${job.generationRoundId}`;
+    const seen=new Set(); let cursor=job;
+    while (cursor?.revisionOfJobId&&!seen.has(cursor.revisionOfJobId)) {
+      seen.add(cursor.revisionOfJobId);
+      const parent=jobMap.get(cursor.revisionOfJobId);
+      if (!parent) break;
+      cursor=parent;
     }
-    if (!items.length) { root.innerHTML='<p class="generation-history-empty">还没有生成记录。选择具体开品方案后，可异步生成主图与详情图。</p>'; return; }
-    root.innerHTML=items.map(job=>{
-      const failedCount=arr(job.failedSlots).length;
-      const status=job.status==='complete'?(failedCount?`部分完成 · 失败 ${failedCount} 张`:'已完成'):job.status==='error'?'失败':`生成中 ${Number(job.progress||0)}%`;
-      const thumbs=orderedResults(job.results).slice(0,15).map(item=>`<button type="button" data-history-preview-url="${esc(item.url)}" data-history-preview-title="${esc(`${modelLabel(item)} · ${item.assetType==='detail'?'详情图':'主图'} ${String(item.slotIndex||'').padStart(2,'0')}`)}"><img loading="lazy" src="${esc(item.url)}" alt="${esc(`${modelLabel(item)} · ${job.planName||'开品方案'}生成图`)}"></button>`).join('');
-      const date=job.createdAt?new Date(Number(job.createdAt)*1000).toLocaleString('zh-CN',{hour12:false}):'';
-      const shootPolicy=job.matchReferenceShooting?'已按参考图拍摄与展示状态一致':'按任务重新设计拍摄与展示';
-      const download=job.jobId && arr(job.results).length ? `<a class="generation-download" href="/api/image-job/${encodeURIComponent(job.jobId)}/download" download>打包下载</a>` : '';
-      const resultCount=arr(job.results).length;
-      const modelSummary=arr(job.comparisonModels).map(item=>`${item.label||item.id}（质量：${modelQuality(item)}）`).filter(Boolean).join('、');
-      return `<article class="generation-record"><header><div><span>${job.comparisonMode?'模型对比任务':'开品方案'}</span><h3>${esc(job.planName||'未命名开品方案')}</h3><p>${esc(job.productName||'')} ${date?'· '+esc(date):''}</p></div><div class="generation-record-actions"><b class="generation-status generation-status-${esc(job.status||'queued')}">${esc(status)}</b>${download}</div></header><p class="generation-record-policy">${modelSummary?`对比模型：${esc(modelSummary)} · `:''}${shootPolicy} · ${job.referenceShootingPolicy==='match_reference'?'锁定机位/构图/光线/动作/摆放':'仅锁定产品身份'}</p>${job.error?`<p class="generation-error">${esc(job.error)}</p>`:''}${thumbs?`<div class="generation-thumbs">${thumbs}</div>`:''}<div class="generation-record-meta"><small>记录编号：${esc(job.jobId||'')}</small>${resultCount?`<small>已保存 ${resultCount} 张图片</small>`:''}</div></article>`;
-    }).join('');
+    return `round:${cursor?.jobId||job?.jobId||'unknown'}`;
+  };
+  const renderRoundSlot=(variant)=>{
+    const versions=variant.versions.slice().sort((a,b)=>
+      Number(a.createdAt||0)-Number(b.createdAt||0) ||
+      Number(a.revisionNumber||1)-Number(b.revisionNumber||1) ||
+      String(a.resultId||a.url||'').localeCompare(String(b.resultId||b.url||''))
+    ).map((item,index)=>({...item,displayRevisionNumber:index+1}));
+    const latest=versions.at(-1), label=`${latest.assetType==='detail'?'详情图':'主图'} ${String(latest.slotIndex||'').padStart(2,'0')}`;
+    const versionData=JSON.stringify(versions);
+    const latestIndex=Math.max(0,versions.length-1);
+    return `<article class="generation-round-slot ${versions.length>1?'has-versions':''}" data-history-version-index="${latestIndex}"><button type="button" class="generation-round-slot-image" data-history-preview-url="${esc(latest.url)}" data-history-revisions="${esc(versionData)}"><img loading="lazy" src="${esc(latest.url)}" alt="${esc(label)}"></button><div class="generation-round-version-switcher"><button type="button" data-history-version-step="-1" aria-label="上一版本" ${versions.length>1?'':'disabled'}>‹</button><strong data-history-version-label>v${latest.displayRevisionNumber} / ${versions.length}</strong><button type="button" data-history-version-step="1" aria-label="下一版本" ${versions.length>1?'':'disabled'}>›</button><button type="button" class="generation-round-revision-button" data-history-revision>重新生成</button></div></article>`;
+  };
+  const render=records=>{
+    const items=arr(records), jobMap=new Map(items.filter(job=>job?.jobId).map(job=>[job.jobId,job]));
+    if (!items.length) {
+      if (countNode) countNode.hidden=true;
+      root.innerHTML='<p class="generation-history-empty">还没有生成记录。选择具体开品方案后，可异步生成主图与详情图。</p>';
+      return;
+    }
+    const rounds=new Map();
+    items.forEach(job=>{
+      const key=roundKeyFor(job,jobMap);
+      if (!rounds.has(key)) rounds.set(key,{key,root:job,variants:new Map(),pending:[],jobs:[]});
+      const round=rounds.get(key); round.jobs.push(job);
+      if (!round.root?.revisionOfJobId&&job.revisionOfJobId) { /* keep the initial task as the round header */ }
+      else if (!round.root?.createdAt||Number(job.createdAt||0)<Number(round.root.createdAt||0)) round.root=job;
+      const results=orderedResults(job.results);
+      if (!results.length&&job.status!=='complete') round.pending.push(job);
+      results.forEach(result=>{
+        const item=historyItem(job,result), variantKey=`${item.taskKey}:${item.modelKey}`;
+        if (!round.variants.has(variantKey)) round.variants.set(variantKey,{key:variantKey,assetType:item.assetType,slotIndex:item.slotIndex,versions:[]});
+        round.variants.get(variantKey).versions.push(item);
+      });
+    });
+    const roundList=[...rounds.values()].sort((a,b)=>Number(b.root?.createdAt||0)-Number(a.root?.createdAt||0));
+    if (!roundList.length) { root.innerHTML='<p class="generation-history-empty">还没有可查看的生成批次。</p>'; return; }
+    if (countNode) {
+      countNode.textContent=roundList.length>99?'99+':String(roundList.length);
+      countNode.hidden=false;
+    }
+    const renderBatch=(batch,batchIndex)=>{
+      const variants=[...batch.variants.values()];
+      const makeSection=(type,title)=>{
+        const list=variants.filter(item=>item.assetType===type).sort((a,b)=>Number(a.slotIndex||0)-Number(b.slotIndex||0));
+        if (!list.length) return `<section class="generation-round-section generation-round-section-empty"><header><div><span>${type==='main'?'MAIN IMAGE TASKS':'DETAIL IMAGE TASKS'}</span><h4>${title}</h4></div><small>本批次未生成</small></header></section>`;
+        return `<section class="generation-round-section"><header><div><span>${type==='main'?'MAIN IMAGE TASKS':'DETAIL IMAGE TASKS'}</span><h4>${title}</h4></div><b>${list.length} 张</b></header><div class="generation-round-grid">${list.map(item=>renderRoundSlot(item)).join('')}</div></section>`;
+      };
+      const rootJob=batch.root||{};
+      const date=rootJob.createdAt?new Date(Number(rootJob.createdAt)*1000).toLocaleString('zh-CN',{hour12:false}):'';
+      const completed=variants.length, pendingCount=batch.pending.length;
+      const statusText=pendingCount?`任务进行中 ${Number(batch.pending[0]?.progress||0)}%`:completed?`${completed} 个图片任务已保存`:'本批次暂无已保存图片';
+      const shootPolicy=rootJob.matchReferenceShooting?'已按参考图拍摄与展示状态一致':'按任务重新设计拍摄与展示';
+      const downloadJob=rootJob.jobId;
+      return `<article class="generation-record generation-round-record"><header><div><span>生成批次 ${batchIndex+1} · ${batch.root?.roundType==='revision'?'二次生成':'整套生成'}</span><h3>${esc(rootJob.planName||'开品方案')} · 主图与详情图</h3><p>${esc(rootJob.productName||'')} ${date?'· '+esc(date):''}</p></div><div class="generation-record-actions"><b class="generation-status generation-status-${esc(rootJob.status||'complete')}">${esc(statusText)}</b>${downloadJob?`<a class="generation-download" href="/api/image-job/${encodeURIComponent(downloadJob)}/download" download>下载本批次</a>`:''}</div></header><p class="generation-record-policy">${esc(shootPolicy)} · ${rootJob.referenceShootingPolicy==='match_reference'?'只显示并使用对应采集参考图':'只锁定产品身份，不显示采集参考图'} · 点击任意图片可切换历史版本或二次生成。</p><div class="generation-round-sections">${makeSection('main','主图生成结果')}${makeSection('detail','详情图生成结果')}</div>${batch.pending.length?`<div class="generation-round-pending">还有 ${batch.pending.length} 个任务正在处理，完成后会自动进入本批次对应分组。</div>`:''}</article>`;
+    };
+    root.innerHTML=`<div class="generation-history-overview"><b>历史生成批次</b><span>共 ${roundList.length} 批，按生成时间倒序展开；每批次独立保留主图与详情图。</span></div>${roundList.map(renderBatch).join('')}`;
   };
   root.addEventListener('click',event=>{
+    const showPreview=(revisions,directRevision=false,startIndex=revisions.length-1)=>{
+      const returnDialog=dialog?.open?dialog:null;
+      if (returnDialog && typeof returnDialog.close === 'function') returnDialog.close();
+      openImagePreview(revisions,Math.max(0,startIndex),directRevision,returnDialog);
+    };
+    const versionButton=event.target.closest('[data-history-version-step]');
+    if (versionButton) {
+      const slot=versionButton.closest('.generation-round-slot'), preview=slot?.querySelector('[data-history-preview-url]');
+      let revisions=[];
+      try { revisions=JSON.parse(preview?.dataset.historyRevisions||'[]'); } catch (_) { revisions=[]; }
+      if (!slot||!preview||revisions.length<2) return;
+      const current=Number(slot.dataset.historyVersionIndex||revisions.length-1);
+      const index=(current+Number(versionButton.dataset.historyVersionStep||0)+revisions.length)%revisions.length;
+      const item=revisions[index];
+      slot.dataset.historyVersionIndex=String(index);
+      preview.dataset.historyPreviewUrl=item.url||'';
+      const image=preview.querySelector('img');
+      if (image) { image.src=item.url||''; image.alt=item.title||'生成图片'; }
+      const label=slot.querySelector('[data-history-version-label]');
+      if (label) label.textContent=`v${item.displayRevisionNumber||index+1} / ${revisions.length}`;
+      return;
+    }
+    const revisionButton=event.target.closest('[data-history-revision]');
+    if (revisionButton) {
+      const slot=revisionButton.closest('.generation-round-slot'), preview=slot?.querySelector('[data-history-preview-url]');
+      let revisions=[];
+      try { revisions=JSON.parse(preview?.dataset.historyRevisions||'[]'); } catch (_) { revisions=[]; }
+      const selectedIndex=Number(slot?.dataset.historyVersionIndex||revisions.length-1);
+      showPreview(revisions,true,selectedIndex);
+      return;
+    }
     const button=event.target.closest('[data-history-preview-url]');
     if (!button) return;
-    const record=button.closest('.generation-record')||root;
-    const buttons=[...record.querySelectorAll('[data-history-preview-url]')];
-    openImagePreview(buttons.map(node=>({url:node.dataset.historyPreviewUrl,title:node.dataset.historyPreviewTitle||'生成图片'})),buttons.indexOf(button));
+    let revisions=[];
+    try { revisions=JSON.parse(button.dataset.historyRevisions||'[]'); } catch (_) { revisions=[]; }
+    const selectedIndex=Number(button.closest('.generation-round-slot')?.dataset.historyVersionIndex||revisions.length-1);
+    showPreview(revisions,false,selectedIndex);
   });
   const load=async()=>{
     clearTimeout(timer);
@@ -993,6 +1137,45 @@ async function main() {
   const heroStats = [['当前价格',sales.currentPrice,'price'],['评论样本',data.baseline?.reviewCount,'sample'],['状态',data.dataQuality?.grade,'status']].filter(([,value])=>hasContent(value));
   document.title = summary.title || product.title || '商品开品分析报告';
   document.getElementById('app').innerHTML = `<div class="report-top"><nav class="report-nav"><div class="wrap"><a class="brand" href="#top">三笙 · 商品开品分析</a><div class="report-nav-actions">${navLinks}${hasPlans?'<a class="quick-product-btn" href="#plan">快速开品 <span>→</span></a>':''}</div></div></nav><header id="top" class="report-hero hero-carousel" tabindex="0">${heroSlides?`<div class="hero-slides">${heroSlides}</div><div class="hero-shade"></div>`:''}<div class="wrap hero-overlay"><div class="hero-copy"><div class="report-kicker">PRODUCT DECISION REPORT · EVIDENCE BASED</div><h1>${esc(summary.title || product.title || '商品分析报告')}</h1>${hasContent(summary.verdict)?`<p>${esc(summary.verdict)}</p>`:''}${auditNotice?`<p class="report-audit-notice" role="status">${esc(auditNotice)}</p>`:''}${heroStats.length?`<div class="hero-meta">${heroStats.map(([label,value,tone])=>`<span class="hero-stat hero-stat-${tone}"><small>${label}</small><b>${esc(value)}</b></span>`).join('')}</div>`:''}</div>${heroDeck?`<div class="hero-deck" aria-label="商品主图牌组">${heroDeck}</div>`:''}${orderedMain.length>1?`<div class="hero-carousel-ui"><button type="button" data-carousel-prev aria-label="上一张主图">←</button><div class="hero-dots">${heroDots}</div><button type="button" data-carousel-next aria-label="下一张主图">→</button></div>`:''}</div></header></div>${sectionHtml}${hasPlans?'<dialog id="quick-plan-dialog" class="quick-plan-dialog"><button class="dialog-close" type="button" data-close-plan aria-label="关闭弹窗">×</button><div class="quick-plan-top"><section class="product-brief"><span>PRODUCT LAUNCH BRIEF · 产品开品说明</span><h2 data-plan-title>快速开品方案</h2><dl><div><dt>产品开品</dt><dd data-plan-product></dd></div><div><dt>主图 / 详情打造</dt><dd data-plan-page></dd></div></dl><div class="brief-controls"><label class="fission-pattern-toggle match-reference-shooting-toggle" data-match-reference-wrap><input type="checkbox" data-match-reference-shooting><span><b>产品图身份 + 采集参考图展示状态（产品展示与参考图拍摄一致）</b><small data-match-reference-note>请同时准备产品图和采集商品对应参考图，才能启用展示状态一致。</small></span></label><label class="fission-pattern-toggle" data-fission-wrap><input type="checkbox" data-fission-pattern checked> 默认裂变花型，先生成相近商品基准图</label><label class="image-user-direction"><span>用户补充要求</span><textarea data-user-direction rows="3" placeholder="例如：更偏高端酒店感、浅色背景、突出面料垂坠；不要填写价格、品牌Logo、认证或改商品结构。"></textarea></label></div></section><section class="reference-upload" aria-label="商品主图参考"><header><b>产品图（商品身份）</b><span>本地上传 · 最多 4 张</span></header><div class="reference-list" data-reference-list></div><div class="reference-empty"><span>＋</span><b>点击或拖拽上传参考图</b><small>本地上传 · 最多 4 张</small></div><label class="reference-upload-btn">＋ 上传产品图<input type="file" accept="image/*" multiple data-reference-input></label><p data-reference-hint></p><em>提示：上传主体清晰、结构完整的产品图；采集商品对应图片自动作为展示状态参考，两者不是同一张图。</em></section></div><section class="image-generation-panel"><header><div><span>AI VISUAL PRODUCTION</span><h3>AI 生图任务</h3><p>勾选任意图片任务，可横向滑动查看；主图最多 5 张，详情图最多 15 张。</p></div><button class="generate-images-btn" type="button" data-generate-images disabled>正在计算生成数量…</button></header><div class="image-generation-controls" data-generation-controls><b>默认勾选：5 张主图 + 6 张详情图。可按需增减。</b><label><input type="checkbox" data-select-type="main"> 生主图 <span>0/0</span></label><label><input type="checkbox" data-select-type="detail"> 生详情 <span>0/0</span></label></div><p class="image-generation-status" data-generate-status aria-live="polite"></p><div class="generated-image-results" data-generate-results></div></section></dialog>':''}<footer class="report-footer"><div class="wrap"><b>数据边界</b> 本报告仅使用本次采集证据；评论主题可以重叠，未准备采集证据时不宣称页面全量。</div></footer>`;
+  if (window.OFFLINE_REPORT) {
+    document.querySelector('.report-nav-actions')?.insertAdjacentHTML('beforeend','<span class="report-offline-label">已保存的离线报告</span>');
+    document.querySelectorAll('.generate-plan-btn,.quick-product-btn,#quick-plan-dialog').forEach(node=>node.remove());
+    initHeroCarousel();
+    return;
+  }
+  const reportId=typeof source==='string' ? source.match(/^\/reports\/([A-Za-z0-9_-]+)\.json$/)?.[1] : null;
+  if (reportId) {
+    const download=document.createElement('button');
+    download.type='button';
+    download.className='report-download-btn';
+    download.textContent='下载含图片报告';
+    download.title='下载可直接打开浏览的单文件离线 HTML 报告';
+    document.querySelector('.report-nav-actions')?.append(download);
+    download.addEventListener('click',async()=>{
+      download.disabled=true;
+      download.textContent='正在打包图片…';
+      try {
+        const response=await fetch(`/api/report-export/${encodeURIComponent(reportId)}`);
+        if (!response.ok) {
+          const result=await readJsonResponse(response,'离线报告下载');
+          throw new Error(result.error||'离线报告下载失败');
+        }
+        const blob=await response.blob();
+        const url=URL.createObjectURL(blob);
+        const link=document.createElement('a');
+        link.href=url;
+        link.download=`${reportId}-offline.html`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),60000);
+        download.textContent='下载含图片报告';
+      } catch(error) {
+        download.textContent='下载失败，点击重试';
+        window.alert(error.message||'离线报告下载失败');
+      } finally { download.disabled=false; }
+    });
+  }
   const modelControls=document.createElement('div');
   modelControls.className='image-model-controls';
   modelControls.setAttribute('data-image-model-controls','');
@@ -1015,9 +1198,9 @@ async function main() {
   historyTrigger.setAttribute('aria-label','打开生成记录');
   historyTrigger.innerHTML='<span class="generation-history-fab-icon" aria-hidden="true">↺</span><span>生成记录</span><b data-generation-history-count hidden>0</b>';
   const historyDialog=document.createElement('dialog');
-  historyDialog.className='generation-history-dialog';
+  historyDialog.className='generation-history-dialog is-fullscreen';
   historyDialog.setAttribute('data-generation-history-dialog','');
-  historyDialog.innerHTML='<header class="generation-history-dialog-head"><div><span>AI VISUAL PRODUCTION</span><h2>生成记录</h2><p>按任务查看生成结果；点击图片查看原图，已有成果可直接打包下载。</p></div><button class="dialog-close" type="button" data-generation-history-close aria-label="关闭生成记录">×</button></header><div class="generation-history" data-generation-history><p class="generation-history-empty">正在读取生成记录…</p></div>';
+  historyDialog.innerHTML='<header class="generation-history-dialog-head"><div><span>AI VISUAL PRODUCTION</span><h2>生成记录</h2><p>历史生成批次直接展开，分别查看主图与详情图；点击指定图片可切换版本或发起二次生成。</p></div><div class="generation-history-dialog-actions"><button type="button" data-generation-history-fullscreen aria-pressed="true"><span data-generation-history-fullscreen-label>退出铺满</span></button><button class="dialog-close" type="button" data-generation-history-close aria-label="关闭生成记录">×</button></div></header><div class="generation-history" data-generation-history><p class="generation-history-empty">正在读取生成记录…</p></div>';
   document.body.append(historyTrigger,historyDialog);
   initHeroCarousel();
   const userDirectionField=document.querySelector('[data-user-direction]');

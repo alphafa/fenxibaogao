@@ -1,4 +1,4 @@
-import json, os, threading, time, uuid, traceback, html, base64, csv, io, zipfile, re, mimetypes, hashlib, urllib.request, urllib.error
+import json, os, threading, time, uuid, traceback, html, base64, csv, io, zipfile, re, mimetypes, hashlib, urllib.request, urllib.error, subprocess
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -129,6 +129,22 @@ def _download_image(url, timeout=18):
             if not _looks_like_image(data,ctype):raise ValueError('not image response')
             return data,ctype
         except Exception as ex:last=ex
+    # macOS Python installations may not trust the same system roots as curl.
+    # Keep certificate verification enabled and use curl's trusted system store
+    # only after urllib's verified attempts have failed.
+    if isinstance(last, urllib.error.URLError) and 'CERTIFICATE_VERIFY_FAILED' in str(last):
+        try:
+            response=subprocess.run(
+                ['curl','--fail','--location','--silent','--show-error','--max-time',str(timeout),
+                 '--max-filesize',str(16*1024*1024),'--user-agent',
+                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+                 '--referer','https://detail.tmall.com/',url],
+                capture_output=True,timeout=timeout+3,check=False,
+            )
+            if response.returncode==0 and len(response.stdout)<=16*1024*1024 and _looks_like_image(response.stdout):
+                return response.stdout,''
+        except (OSError,subprocess.TimeoutExpired):
+            pass
     raise last or RuntimeError('image download failed')
 
 def cache_report_images(result, task_id):
@@ -164,6 +180,81 @@ def cache_report_images(result, task_id):
     result.setdefault('meta',{})['imageCache']={'success':ok,'failed':failed,'skipped':skipped,'mode':'local-first-multi-retry-remote-fallback'}
     return result
 
+def build_offline_report(report_id):
+    """Return a standalone HTML report with every evidence image embedded."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]+',report_id):
+        raise ValueError('报告编号无效')
+    report_path=REPORTS/f'{report_id}.json'
+    if not report_path.is_file():
+        raise FileNotFoundError('报告文件不存在')
+    data=json.loads(report_path.read_text('utf-8'))
+    entries=[e for e in data.get('evidenceLedger') or [] if isinstance(e,dict) and e.get('type')=='image']
+    embedded={}; local_urls={}; cache_updates={}; failures=[]
+    for entry in entries:
+        meta=entry.setdefault('meta',{})
+        source=_normalize_asset_url(meta.get('sourceUrl') or entry.get('value'))
+        if not source:
+            failures.append(str(entry.get('id') or '未知图片'))
+            continue
+        if source not in embedded:
+            local=str(meta.get('localUrl') or '')
+            candidate=(REPORTS/local.removeprefix('/reports/')).resolve() if local.startswith('/reports/assets/') else None
+            if candidate and REPORTS.resolve() in candidate.parents and candidate.is_file():
+                image_bytes=candidate.read_bytes()
+                local_url=local
+            else:
+                try:
+                    if source.startswith('data:image/'):
+                        header,payload=source.split(',',1)
+                        image_bytes=base64.b64decode(payload) if ';base64' in header else unquote_to_bytes(payload)
+                    elif source.startswith(('https://','http://')):
+                        image_bytes,_=_download_image(source)
+                    else:
+                        raise ValueError('不支持的图片地址')
+                except Exception:
+                    failures.append(str(entry.get('id') or '未知图片'))
+                    continue
+                if _looks_like_image(image_bytes):
+                    group=re.sub(r'[^a-zA-Z0-9_-]+','_',str(meta.get('group') or 'other'))
+                    eid=re.sub(r'[^a-zA-Z0-9_-]+','_',str(entry.get('id') or hashlib.sha1(source.encode()).hexdigest()[:12]))
+                    target=IMAGE_ASSET_ROOT/report_id/group/(eid+_asset_ext(source))
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    target.write_bytes(image_bytes)
+                    local_url=f'/reports/assets/{report_id}/{group}/{target.name}'
+            if not _looks_like_image(image_bytes):
+                failures.append(str(entry.get('id') or '未知图片'))
+                continue
+            mime=mimetypes.guess_type(source.split('?',1)[0])[0]
+            if not mime or not mime.startswith('image/'):
+                mime=mimetypes.guess_type(str(candidate or ''))[0] or 'image/jpeg'
+            embedded[source]=f'data:{mime};base64,{base64.b64encode(image_bytes).decode("ascii")}'
+            local_urls[source]=local_url
+        if meta.get('localUrl')!=local_urls[source] or meta.get('cacheStatus')!='success':
+            cache_updates[entry.get('id')]=local_urls[source]
+        meta['localUrl']=embedded[source]
+    if failures:
+        raise ValueError(f'有 {len(failures)} 张报告图片未能下载，暂不提供缺图文件。请检查网络或图片源后重试。')
+    if cache_updates:
+        # Persist the restored local cache paths, not the larger inline data URIs.
+        cached=json.loads(report_path.read_text('utf-8'))
+        for old in cached.get('evidenceLedger') or []:
+            if not isinstance(old,dict) or old.get('id') not in cache_updates: continue
+            old.setdefault('meta',{})['localUrl']=cache_updates[old['id']]
+            old['meta']['cacheStatus']='success'
+            old['meta'].pop('cacheError',None)
+        statuses=[e.get('meta',{}).get('cacheStatus') for e in cached.get('evidenceLedger') or [] if isinstance(e,dict) and e.get('type')=='image']
+        cached.setdefault('meta',{})['imageCache']={'success':statuses.count('success'),'failed':statuses.count('failed'),'skipped':len(statuses)-statuses.count('success')-statuses.count('failed'),'mode':'local-first-multi-retry-remote-fallback'}
+        temp_path=report_path.with_name(report_path.name+'.'+uuid.uuid4().hex+'.tmp')
+        temp_path.write_text(json.dumps(cached,ensure_ascii=False,indent=2),'utf-8')
+        os.replace(temp_path,report_path)
+    document=(ROOT/'report.html').read_text('utf-8')
+    payload=json.dumps(data,ensure_ascii=False,separators=(',',':')).replace('</','<\\/').replace('\u2028','\\u2028').replace('\u2029','\\u2029')
+    css=(ROOT/'report.css').read_text('utf-8').replace('</style','<\\/style')
+    js=(ROOT/'report.js').read_text('utf-8').replace('</script','<\\/script')
+    document=re.sub(r'<link rel="stylesheet" href="/report\.css[^\"]*">',lambda _:f'<style>{css}</style>',document,count=1)
+    document=re.sub(r'<script src="/report\.js[^\"]*"></script>',lambda _:f'<script>window.REPORT_DATA={payload};window.OFFLINE_REPORT=true;\n{js}</script>',document,count=1)
+    return document.encode('utf-8')
+
 def _generated_ext(content_type='', url=''):
     return _asset_ext(url, content_type) if content_type or url else '.png'
 
@@ -185,6 +276,45 @@ def _save_generated_item(item, root, index):
     if not _looks_like_image(data,ctype): raise ValueError('图片接口返回内容不是有效图片')
     ext=_generated_ext(ctype,str(url or '')); target=root/f'{index:02d}{ext}'; target.write_bytes(data)
     return {'url':f'/reports/assets/generated/{root.name}/{target.name}','sourceUrl':url if isinstance(url,str) and url.startswith(('http://','https://')) else '', 'width':None,'height':None,'_path':str(target)}
+
+def _result_task_key(item):
+    item=item if isinstance(item,dict) else {}
+    return str(item.get('taskKey') or f"{item.get('assetType') or 'main'}:{item.get('slotIndex') or 0}")
+
+def _result_revision_number(item, default=1):
+    try:
+        return max(1,int((item or {}).get('revisionNumber') or default))
+    except Exception:
+        return default
+
+def _next_result_revision_number(parent_job, parent_result):
+    """Allocate the next visible version across successful sibling branches."""
+    parent_job=parent_job if isinstance(parent_job,dict) else {}
+    parent_result=parent_result if isinstance(parent_result,dict) else {}
+    task_key=_result_task_key(parent_result)
+    root_result_id=str(parent_result.get('rootResultId') or '').strip()
+    round_id=str(parent_job.get('generationRoundId') or parent_job.get('roundId') or parent_job.get('jobId') or '').strip()
+    model_key=str(parent_result.get('modelKey') or parent_result.get('model') or 'default')
+    jobs={key:dict(value) for key,value in IMAGE_JOBS.items() if isinstance(value,dict)}
+    for saved in REPORTS.glob('generated_*.json'):
+        try:
+            job=json.loads(saved.read_text('utf-8'))
+            if isinstance(job,dict) and job.get('jobId'): jobs[job['jobId']]=job
+        except Exception:
+            continue
+    siblings=[]
+    for job in jobs.values():
+        job_round=str(job.get('generationRoundId') or job.get('roundId') or job.get('jobId') or '').strip()
+        if round_id and job_round!=round_id: continue
+        for item in job.get('results') or []:
+            if not isinstance(item,dict) or _result_task_key(item)!=task_key: continue
+            item_model=str(item.get('modelKey') or item.get('model') or 'default')
+            if item_model!=model_key: continue
+            item_root=str(item.get('rootResultId') or '').strip()
+            if root_result_id and item_root and item_root!=root_result_id: continue
+            siblings.append(item)
+    unique={str(item.get('resultId') or item.get('url') or id(item)) for item in siblings}
+    return max(_result_revision_number(parent_result)+1,len(unique)+1)
 
 def _generated_item_data_url(item):
     path=Path(str((item or {}).get('_path') or ''))
@@ -748,11 +878,18 @@ def resolve_reference_images(report, plan, requested=None):
     same product; per-slot routing decides how many images reach the provider.
     """
     uploads=[]
+    if isinstance(requested,list) and len(requested)>4:
+        raise ValueError('单次生图最多四张参考图')
     for value in requested or []:
         value=str(value or '').strip()
         if not value: continue
         if value.startswith('data:image/'):
             if len(value)>12*1024*1024: raise ValueError('单张参考图不能超过 9MB')
+            uploads.append(value)
+        elif value.startswith('/reports/assets/reference_uploads/'):
+            path=(REPORTS/value[len('/reports/'):]).resolve()
+            if (IMAGE_ASSET_ROOT/'reference_uploads').resolve() not in path.parents or not path.is_file():
+                raise ValueError('上传参考图不存在或路径无效')
             uploads.append(value)
         elif value.startswith(('http://','https://')):
             uploads.append(value)
@@ -880,19 +1017,31 @@ def _slot_reference_images(report, slot, reference_images, reference_source, ref
     }
     if not refs:
         return [],meta
+    # Every preview slot must expose the identity reference, including
+    # fission follow-up slots.  The fission branch still sends the generated
+    # base image to the provider, but the UI must not lose the original
+    # reference image metadata.
+    meta['identityReferenceUrl']=refs[0]
+    # The card preview is slot-specific even when the provider follows a
+    # shared/fission identity reference. Resolve and expose the collected
+    # image before the fission early return so main:02/detail:02 do not show
+    # main:01 as their visual reference.
+    collected=_collected_slot_reference(report,slot)
+    collected_url=collected.get('url')
+    if collected_url:
+        meta['displayReferenceUrl']=collected_url
+        meta['displayReferenceBinding']=collected.get('binding','')
+        meta['displayReferenceEvidenceId']=collected.get('evidenceId','')
+        meta['displayReferenceImageIndex']=collected.get('imageIndex')
     if reference_mode=='fission_followup' and not _coerce_bool(match_reference_shooting, False):
         meta['referenceBinding']='generated_fission_base'
         return refs[:1],meta
-    collected=_collected_slot_reference(report,slot)
-    collected_url=collected.get('url')
     # Preview metadata always exposes the slot's corresponding collected
     # image, even when display-state matching is disabled. The UI needs to
     # show the reference that would be used for this slot without making that
     # image an input to the provider.
     if refs:
         meta['identityReferenceUrl']=refs[0]
-    if collected_url:
-        meta['displayReferenceUrl']=collected_url
     if not _coerce_bool(match_reference_shooting, False):
         return refs[:4],meta
 
@@ -1368,6 +1517,84 @@ def _persist_image_job(job_id, state):
     payload['jobId']=job_id
     (REPORTS/f'generated_{job_id}.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),'utf-8')
 
+def _generation_intent_fingerprint(report, plan, slots, request, references):
+    """Bind a reusable interpretation to the exact product, plan and inputs."""
+    payload={
+        'product':(report.get('facts') or {}).get('product'),
+        'attributes':(report.get('facts') or {}).get('attributes'),
+        'plan':plan,
+        'slots':[{'assetType':s.get('assetType'),'index':s.get('index'),
+                  'task':s.get('task'),'referenceAnalysis':s.get('referenceAnalysis')} for s in slots],
+        'userDirection':request.get('userDirection'),
+        'promptOverrides':request.get('promptOverrides'),
+        'matchReferenceShooting':_match_reference_shooting(request,False),
+        'referenceHashes':[hashlib.sha256(str(ref).encode('utf-8')).hexdigest() for ref in references],
+    }
+    return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True,default=str).encode('utf-8')).hexdigest()
+
+def save_generation_reference(data_url):
+    """Store one validated local product reference before job submission."""
+    value=str(data_url or '')
+    match=re.fullmatch(r'data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)',value)
+    if not match:
+        raise ValueError('仅支持 PNG、JPEG 或 WebP 参考图')
+    mime,encoded=match.groups()
+    try:
+        binary=base64.b64decode(encoded,validate=True)
+    except Exception as error:
+        raise ValueError('参考图数据无效') from error
+    signatures={
+        'image/png':binary.startswith(b'\x89PNG\r\n\x1a\n'),
+        'image/jpeg':binary.startswith(b'\xff\xd8\xff'),
+        'image/webp':binary[:4]==b'RIFF' and binary[8:12]==b'WEBP',
+    }
+    if not signatures[mime] or not binary or len(binary)>9*1024*1024:
+        raise ValueError('参考图格式无效或超过 9MB')
+    suffix={'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp'}[mime]
+    folder=IMAGE_ASSET_ROOT/'reference_uploads'
+    folder.mkdir(parents=True,exist_ok=True)
+    name=uuid.uuid4().hex+suffix
+    (folder/name).write_bytes(binary)
+    return f'/reports/assets/reference_uploads/{name}'
+
+def image_generation_setup(report, plan_index=0, reference_images=None, match_reference_shooting=False, fission_pattern=None):
+    exp=report.get('experienceSolution') or {}
+    plans=(exp.get('newProductPlans') or {}).get('plans') or (report.get('launchPlans') or {}).get('plans') or []
+    index=int(plan_index)
+    if not plans or index<0 or index>=len(plans):
+        raise ValueError('方案索引无效')
+    plan=plans[index]
+    try:
+        refs,reference_source=resolve_reference_images(report,plan,reference_images)
+    except ValueError as error:
+        # Setup is a read-only preview step. It must still render the slots
+        # when the report has no product image; final submission keeps the
+        # strict reference validation.
+        if '没有可用的商品主图' not in str(error):
+            raise
+        refs,reference_source=[], 'none'
+    fission=bool(reference_source!='uploaded' if fission_pattern is None else fission_pattern) and reference_source!='uploaded' and not _coerce_bool(match_reference_shooting,False)
+    slots=[]
+    # Prompt preview is deterministic local assembly; it does not invoke the
+    # AI intent parser.  This lets the editing UI show the exact default
+    # prompt before the user confirms generation.
+    preview_direction={}
+    preview_identity=build_identity_lock(
+        report,plan,preview_direction,
+        uploaded_product_identity=reference_source=='uploaded',
+    )
+    for slot in build_generation_slots(report,plan):
+        mode=image_reference_mode(reference_source,fission,slot,_coerce_bool(match_reference_shooting,False))
+        _,reference_meta=_slot_reference_images(report,slot,refs,reference_source,mode,_coerce_bool(match_reference_shooting,False))
+        annotated=dict(slot); annotated.update(reference_meta)
+        annotated['prompt']=build_image_prompt(
+            report,plan,slot.get('assetType','main'),int(slot.get('index',1))-1,
+            annotated,preview_direction.get(f"{slot.get('assetType')}:{slot.get('index')}"),
+            mode,preview_identity,_coerce_bool(match_reference_shooting,False),
+        )
+        slots.append(annotated)
+    return {'ok':True,'slots':slots,'creditPricingAvailable':False,'referenceSource':reference_source,'referenceCount':len(refs),'matchReferenceShooting':_coerce_bool(match_reference_shooting,False)}
+
 def _load_image_job(job_id):
     """Read an image job from memory first, then fall back to its checkpoint."""
     job_id=str(job_id or '').strip()
@@ -1384,6 +1611,62 @@ def _load_image_job(job_id):
     except Exception:
         return None
     return dict(job) if isinstance(job,dict) else None
+
+def _revision_job_chain(parent_job):
+    """Return the selected parent followed by its persisted ancestors."""
+    chain=[]; seen=set(); current=parent_job if isinstance(parent_job,dict) else None
+    while current and str(current.get('jobId') or '') not in seen:
+        chain.append(current)
+        job_id=str(current.get('jobId') or '')
+        if job_id: seen.add(job_id)
+        ancestor_id=str(current.get('revisionOfJobId') or '').strip()
+        if not ancestor_id or ancestor_id in seen: break
+        current=_load_image_job(ancestor_id)
+    return chain
+
+def _revision_job_value(chain, key, default=None):
+    for job in chain:
+        if key in job and job.get(key) is not None:
+            return job.get(key)
+    return default
+
+def _revision_reference_images(parent_job):
+    """Recover original product references without mixing in display refs."""
+    chain=_revision_job_chain(parent_job)
+    for job in chain:
+        refs=job.get('referenceImages')
+        if isinstance(refs,list) and any(str(item or '').strip() for item in refs):
+            return list(dict.fromkeys(str(item).strip() for item in refs if str(item or '').strip()))[:4]
+    recovered=[]
+    for job in chain:
+        results=[item for item in (job.get('results') or []) if isinstance(item,dict)]
+        uploaded_mode=(
+            str(job.get('referenceSource') or '')=='uploaded' or
+            any(str(item.get('referenceBinding') or '').startswith(('uploaded_','primary_uploaded_','slot_uploaded_')) for item in results)
+        )
+        if not uploaded_mode: continue
+        for item in results:
+            value=str(item.get('identityReferenceUrl') or '').strip()
+            if value.startswith(('data:image/','http://','https://','/reports/assets/reference_uploads/')) and value not in recovered:
+                recovered.append(value)
+    return recovered[:4]
+
+def _revision_fission_base(parent_job, parent_result):
+    """Load the original round's generated identity base for a follow-up slot."""
+    if _result_task_key(parent_result)=='main:1': return ''
+    chain=_revision_job_chain(parent_job)
+    round_id=str(_revision_job_value(chain,'generationRoundId','') or '').strip()
+    if round_id and all(str(job.get('jobId') or '')!=round_id for job in chain):
+        root=_load_image_job(round_id)
+        if root: chain.append(root)
+    for job in reversed(chain):
+        if not bool(job.get('fissionPattern',False)): continue
+        candidates=[item for item in (job.get('results') or []) if isinstance(item,dict) and _result_task_key(item)=='main:1']
+        candidates.sort(key=lambda item:_result_revision_number(item))
+        for item in candidates:
+            data_url=_generated_item_data_url(item)
+            if data_url: return data_url
+    return ''
 
 def _generated_item_path(job_id, item):
     """Resolve one persisted result without allowing paths outside its job folder."""
@@ -1459,7 +1742,16 @@ def _generation_worker(job_id, report, request):
             _collect_prompt_product_overrides(prompt_overrides,blocked_terms),
         )
         slots=build_generation_slots(report,plan)
-        user_direction=_resolve_image_user_intent(report,plan,slots,user_direction,prompt_overrides,reference_images,match_reference_shooting)
+        intent_fingerprint=_generation_intent_fingerprint(report,plan,slots,request,reference_images)
+        previous=_load_image_job(request.get('reuseAnalysisJobId')) if request.get('reuseAnalysisJobId') else None
+        if previous and previous.get('analysisInputHash')==intent_fingerprint and isinstance(previous.get('resolvedUserDirection'),dict):
+            user_direction=previous['resolvedUserDirection']
+        else:
+            IMAGE_JOBS[job_id].update(status='preparing',progress=10)
+            _persist_image_job(job_id,IMAGE_JOBS[job_id])
+            user_direction=_resolve_image_user_intent(report,plan,slots,user_direction,prompt_overrides,reference_images,match_reference_shooting)
+        IMAGE_JOBS[job_id].update(analysisInputHash=intent_fingerprint,resolvedUserDirection=user_direction)
+        _persist_image_job(job_id,IMAGE_JOBS[job_id])
         identity_lock=build_identity_lock(
             report,plan,user_direction,
             uploaded_product_identity=reference_source=='uploaded',
@@ -1473,7 +1765,8 @@ def _generation_worker(job_id, report, request):
             try: count=max(1,min(6,int(request.get('count',1))))
             except Exception: count=1
             selected_slots=[{'assetType':asset_type,'index':i+1} for asset_type in types for i in range(count)][:12]
-        if fission_pattern and not any(slot.get('assetType')=='main' and slot.get('index')==1 for slot in selected_slots):
+        inherited_fission_base=str(request.get('fissionBaseReference') or '').strip()
+        if fission_pattern and not inherited_fission_base and not any(slot.get('assetType')=='main' and slot.get('index')==1 for slot in selected_slots):
             base_slot=next((slot for slot in slots if slot.get('assetType')=='main' and slot.get('index')==1), None)
             if base_slot:
                 selected_slots=[base_slot]+selected_slots
@@ -1490,18 +1783,45 @@ def _generation_worker(job_id, report, request):
              'modelKey':_image_model_key(spec.get('id') or 'default')}
             for spec in model_specs
         ]
+        slot_reference_map={}
+        for slot in selected_slots:
+            prompt_key=f"{slot.get('assetType')}:{slot.get('index')}"
+            reference_mode=image_reference_mode(reference_source,fission_pattern,slot,match_reference_shooting)
+            _,reference_meta=_slot_reference_images(report,slot,reference_images,reference_source,reference_mode,match_reference_shooting)
+            slot_reference_map[prompt_key]={key:value for key,value in reference_meta.items() if key.endswith('Url') or key.endswith('Id') or key.endswith('Index') or key in ('referenceBinding','displayReferenceBinding')}
+        revision_number=max(1,int(request.get('revisionNumber') or 1))
+        revision_of_job_id=str(request.get('revisionOfJobId') or '')
+        parent_result_id=str(request.get('parentResultId') or '')
+        revision_reason=str(request.get('revisionReason') or '').strip()
+        reuse_prompt=str(request.get('reusePrompt') or '').strip()
+        generation_round_id=str(request.get('generationRoundId') or request.get('roundId') or '').strip()
+        if not generation_round_id:
+            generation_round_id=str(request.get('rootGenerationJobId') or revision_of_job_id or job_id)
+        round_type='revision' if revision_of_job_id else 'initial'
+        root_result_ids=request.get('rootResultIds') if isinstance(request.get('rootResultIds'),dict) else {}
+        for slot in selected_slots:
+            key=f"{slot.get('assetType')}:{slot.get('index')}"
+            root_result_ids.setdefault(key, f"root_{uuid.uuid4().hex[:12]}")
         state=IMAGE_JOBS.setdefault(job_id,{})
         state.update({'jobId':job_id,'status':'generating','progress':20,'results':results,
                       'planName':plan.get('name') or '未命名开品方案','productName':identity_lock.get('productName') or '商品',
                       'referenceRoleVersion':REFERENCE_ROLE_VERSION,
-                      'reportSource':str(request.get('source') or ''),'assetTypes':types,'completeSet':complete_set,
+                      'reportSource':str(request.get('source') or ''),'planIndex':int(request.get('planIndex',0) or 0),
+                      'assetTypes':types,'completeSet':complete_set,
                       'expectedSlots':selected_slots,'referenceSource':reference_source,'referenceCount':len(reference_images),
+                      'referenceImages':list(request.get('referenceImages') or []) if isinstance(request.get('referenceImages'),list) else [],
+                      'slotReferences':slot_reference_map,
                       'userDirection':user_direction,'userDirectionBySlot':user_direction_by_slot,
+                      'analysisInputHash':intent_fingerprint,'resolvedUserDirection':user_direction,
                       'comparisonMode':comparison_mode,'comparisonModels':comparison_models,
                       'selectedImageModels':[item['id'] for item in comparison_models],
                       'fissionPattern':fission_pattern,
                       'matchReferenceShooting':match_reference_shooting,
-                      'referenceShootingPolicy':'match_reference' if match_reference_shooting else 'identity_only'})
+                      'referenceShootingPolicy':'match_reference' if match_reference_shooting else 'identity_only',
+                      'promptOverrides':prompt_overrides,'revisionNumber':revision_number,
+                      'revisionOfJobId':revision_of_job_id,'parentResultId':parent_result_id,
+                      'revisionReason':revision_reason,'rootResultIds':root_result_ids,
+                      'generationRoundId':generation_round_id,'roundType':round_type})
         _persist_image_job(job_id,state)
         result_lock=threading.Lock()
         def generate_slot(order_slot, refs, reference_mode, model_spec, persist_index):
@@ -1512,12 +1832,23 @@ def _generation_worker(job_id, report, request):
             slot_refs,reference_meta=_slot_reference_images(
                 report,slot,refs,reference_source,reference_mode,match_reference_shooting,
             )
+            if revision_of_job_id and reference_source=='uploaded' and match_reference_shooting:
+                # A revision must keep the confirmed prompt and product identity
+                # stable. The collected image remains prompt/display metadata,
+                # but sending it as a second product image lets providers copy
+                # its merchandise despite the role instructions.
+                slot_refs=slot_refs[:1]
+                reference_meta['displayReferenceTransport']='prompt_only'
             prompt_slot=dict(slot); prompt_slot.update(reference_meta)
-            base_prompt=build_image_prompt(
-                report, plan, asset_type, i, prompt_slot, slot_direction, reference_mode,
-                identity_lock, match_reference_shooting,
-            )
-            prompt,prompt_merge=merge_image_prompt_with_user_edit(base_prompt,prompt_overrides.get(prompt_key),slot,slot_direction)
+            if reuse_prompt and revision_of_job_id and not revision_reason:
+                prompt=reuse_prompt
+                prompt_merge={'mode':'reused_confirmed_prompt','related':False,'matched':[],'ignored':[]}
+            else:
+                base_prompt=build_image_prompt(
+                    report, plan, asset_type, i, prompt_slot, slot_direction, reference_mode,
+                    identity_lock, match_reference_shooting,
+                )
+                prompt,prompt_merge=merge_image_prompt_with_user_edit(base_prompt,prompt_overrides.get(prompt_key),slot,slot_direction)
             # The first main image is the identity master, but matching mode
             # still needs its corresponding collected image as input 2; that
             # is the only way the provider can see the requested pose/layout.
@@ -1561,14 +1892,22 @@ def _generation_worker(job_id, report, request):
                           ),
                           **reference_meta,
                           'referenceCount':len(slot_refs),
-                          'referenceCountUsed':len(slot_refs)})
+                          'referenceCountUsed':len(slot_refs),
+                          'taskKey':prompt_key,
+                          'resultId':f"res_{uuid.uuid4().hex[:14]}",
+                          'revisionNumber':revision_number,
+                          'revisionOfJobId':revision_of_job_id,
+                          'parentResultId':parent_result_id,
+                          'rootResultId':root_result_ids.get(prompt_key),
+                          'generationRoundId':generation_round_id,
+                          'roundType':round_type})
             saved.update({
                 'referenceAnalysis':slot.get('referenceAnalysis') or {},
             })
             return saved
         ordered_slots=list(enumerate(selected_slots))
-        fission_item=next((item for item in ordered_slots if item[1].get('assetType')=='main' and item[1].get('index')==1), None) if fission_pattern else None
-        followup_refs=reference_images
+        fission_item=next((item for item in ordered_slots if item[1].get('assetType')=='main' and item[1].get('index')==1), None) if fission_pattern and not inherited_fission_base else None
+        followup_refs=[inherited_fission_base] if inherited_fission_base else reference_images
         if fission_item:
             # The fission base is always the first persisted asset.  When the
             # caller selected only detail slots we prepend the base above, but
@@ -1610,7 +1949,7 @@ def _generation_worker(job_id, report, request):
             futures={
                 image_pool.submit(
                     generate_slot,(order,slot),
-                    followup_refs if fission_item else reference_images,
+                    followup_refs if (fission_item or inherited_fission_base) else reference_images,
                     image_reference_mode(reference_source,fission_pattern,slot,match_reference_shooting),
                     model_spec,persist_index,
                 ):(slot,model_spec)
@@ -1641,10 +1980,14 @@ def _generation_worker(job_id, report, request):
         meta={'jobId':job_id,'status':'complete','progress':100,'results':_ordered_generated_results(results),'failedSlots':failed_slots,
               'partialFailure':bool(failed_slots),'planName':plan.get('name') or '未命名开品方案',
               'productName':identity_lock.get('productName') or '商品','reportSource':str(request.get('source') or ''),
+              'planIndex':int(request.get('planIndex',0) or 0),
               'referenceRoleVersion':REFERENCE_ROLE_VERSION,
               'createdAt':IMAGE_JOBS.get(job_id,{}).get('createdAt') or time.time(),'completedAt':time.time(),
               'assetTypes':types,'completeSet':complete_set,'expectedSlots':selected_slots,'referenceSource':reference_source,'referenceCount':len(reference_images),
+              'referenceImages':list(request.get('referenceImages') or []) if isinstance(request.get('referenceImages'),list) else [],
+              'slotReferences':IMAGE_JOBS.get(job_id,{}).get('slotReferences',{}),
               'userDirection':user_direction,'userDirectionBySlot':user_direction_by_slot,
+              'analysisInputHash':intent_fingerprint,'resolvedUserDirection':user_direction,
               'comparisonMode':comparison_mode,'comparisonModels':comparison_models,
               'selectedImageModels':[item['id'] for item in comparison_models],
               'imageConcurrency':state.get('imageConcurrency',5),
@@ -1653,6 +1996,10 @@ def _generation_worker(job_id, report, request):
                 'message':'主图与详情图共享同一产品身份锁；正式发布前需做商品结构、颜色、材质、规格与文案复核。',
                 'checks':['product_identity_shared','plan_constraints_shared','platform_rules_embedded']
               }}
+        meta.update({'promptOverrides':prompt_overrides,'revisionNumber':revision_number,
+                     'revisionOfJobId':revision_of_job_id,'parentResultId':parent_result_id,
+                     'revisionReason':revision_reason,'rootResultIds':root_result_ids,
+                     'generationRoundId':generation_round_id,'roundType':round_type})
         meta['matchReferenceShooting']=match_reference_shooting
         meta['referenceShootingPolicy']='match_reference' if match_reference_shooting else 'identity_only'
         _persist_image_job(job_id,meta); IMAGE_JOBS[job_id]=meta
@@ -1985,7 +2332,7 @@ def control_page():
     *{{box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5faf9;color:#10191d;margin:0}}.wrap{{max-width:1160px;margin:54px auto;padding:0 24px 60px}}.hero{{background:#071114;color:#fff;padding:34px;border-radius:22px;border-top:5px solid #00cdb0}}h1{{font-size:38px;margin:0 0 10px}}h2{{letter-spacing:-.02em}}.sub{{color:#b9d0d4;line-height:1.65}}.card{{margin-top:18px;background:#fff;border:1px solid #dbe8e8;border-radius:18px;padding:24px}}.status{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.pill{{padding:14px;border-radius:12px;background:#eef9f7;font-weight:700}}.ok{{color:#008c78}}.bad{{color:#c54552}}label{{display:block;font-size:13px;font-weight:700;margin:16px 0 7px}}input,textarea{{width:100%;padding:13px 14px;border:1px solid #bcd8d6;border-radius:10px;font-size:15px}}textarea{{min-height:108px;resize:vertical;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}}.field-help{{display:block;margin-top:6px;color:#6f7d80;font-size:12px;line-height:1.55;overflow-wrap:anywhere}}button{{margin-top:18px;border:0;border-radius:10px;padding:13px 18px;background:linear-gradient(110deg,#00cdb0,#008fd8);color:white;font-weight:800;font-size:15px;cursor:pointer}}button.secondary{{background:#071114;margin-left:8px}}#msg{{margin-top:12px;white-space:pre-wrap}}code{{background:#eaf7f5;padding:3px 6px;border-radius:5px;color:#087465;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}a{{color:#087f70}}.section-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}}.section-head h2{{margin:4px 0 8px;font-size:28px}}.section-head p{{max-width:760px;margin:0;color:#667477;line-height:1.65}}.eyebrow{{color:#008f7a;font-size:11px;font-weight:900;letter-spacing:.14em}}.doc-link{{flex:0 0 auto;display:inline-flex;align-items:center;padding:9px 12px;border:1px solid #a9d7d0;border-radius:9px;background:#f1fbf9;font-size:12px;font-weight:800;text-decoration:none}}.workflow-card{{border-top:4px solid #00b99f}}.flow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:22px 0 0;padding:0;list-style:none;counter-reset:flow}}.flow li{{position:relative;min-height:142px;padding:15px 13px;border:1px solid #d8e7e5;border-radius:13px;background:linear-gradient(155deg,#f7fcfb,#eef8f6);counter-increment:flow}}.flow li::before{{content:"0" counter(flow);display:block;margin-bottom:18px;color:#00a58e;font-size:11px;font-weight:900;letter-spacing:.08em}}.flow li:not(:last-child)::after{{content:"→";position:absolute;z-index:2;right:-9px;top:66px;width:18px;height:18px;border:1px solid #cae2de;border-radius:50%;background:#fff;color:#008f7a;text-align:center;font-size:12px;line-height:16px}}.flow b{{display:block;margin-bottom:7px;font-size:14px}}.flow small{{display:block;color:#68777a;font-size:11px;line-height:1.55}}.code-name{{display:block;margin-top:8px;color:#087f70;font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}.runtime-strip{{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:8px;margin-top:12px}}.runtime-item{{padding:10px 12px;border-radius:10px;background:#091619;color:#d6e7e7;font-size:11px;line-height:1.5;overflow-wrap:anywhere}}.runtime-item b{{display:block;color:#27d8bd;font-size:10px;letter-spacing:.08em}}.runtime-chain{{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:#e9f7f4;color:#47605d;font-size:11px;line-height:1.6;overflow-wrap:anywhere}}.runtime-chain b{{color:#087f70;margin-right:8px}}.dev-grid{{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:14px}}.dev-panel{{border:1px solid #dbe8e8;border-radius:14px;overflow:hidden;background:#fff}}.dev-panel>header{{padding:15px 16px;background:#f5faf9}}.dev-panel h3{{margin:0 0 4px;font-size:16px}}.dev-panel header p{{margin:0;color:#6d797b;font-size:11px;line-height:1.5}}.prompt-stack{{margin:0;padding:6px 16px 14px;list-style:none;counter-reset:layer}}.prompt-stack li{{display:grid;grid-template-columns:26px 1fr;gap:8px;padding:9px 0;border-bottom:1px solid #edf3f2;counter-increment:layer}}.prompt-stack li:last-child{{border-bottom:0}}.prompt-stack li::before{{content:counter(layer);display:flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:6px;background:#e5f6f3;color:#008a76;font-size:10px;font-weight:900}}.prompt-stack b{{font-size:12px}}.prompt-stack span{{display:block;margin-top:3px;color:#6d797b;font-size:10px;line-height:1.5}}.branch-list{{margin:0;padding:7px 16px 15px;list-style:none}}.branch-list li{{padding:10px 0;border-bottom:1px solid #edf3f2;font-size:11px;line-height:1.55}}.branch-list li:last-child{{border-bottom:0}}.branch-list b{{display:block;margin-bottom:2px;color:#0b7567;font-size:12px}}.formula{{margin:0 16px 16px;padding:11px 12px;border-radius:10px;background:#071114;color:#d8e9e8;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}details.tech-detail{{min-width:0;margin-top:14px;border:1px solid #dbe8e8;border-radius:14px;background:#fff;overflow:hidden}}details.tech-detail>summary{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px;background:#f5faf9;cursor:pointer;font-size:14px;font-weight:800}}details.tech-detail>summary small{{color:#718083;font-size:11px;font-weight:500}}.table-wrap{{max-width:100%;overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-size:11px}}th,td{{padding:11px 12px;border-top:1px solid #e4eeec;text-align:left;vertical-align:top;line-height:1.55}}th{{background:#fbfdfd;color:#506063;font-size:10px;letter-spacing:.05em;white-space:nowrap}}td:first-child{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#087465;white-space:nowrap}}.callout{{margin:14px 0 0;padding:12px 14px;border-left:4px solid #00ad94;border-radius:8px;background:#edf9f7;color:#47605d;font-size:12px;line-height:1.65}}.dev-grid>*,.channel-grid>*,.channel-grid>.card{{min-width:0}}.channel-grid{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}}.channel-grid>.card{{height:max-content}}@media(max-width:980px){{.flow{{grid-template-columns:repeat(3,minmax(0,1fr))}}.flow li:nth-child(3)::after{{display:none}}.runtime-strip{{grid-template-columns:1fr 1fr}}.dev-grid,.channel-grid{{grid-template-columns:minmax(0,1fr)}}}}@media(max-width:700px){{.wrap{{margin-top:24px;padding:0 14px 40px}}h1{{font-size:30px}}.hero,.card{{padding:20px}}.status,.flow,.runtime-strip{{grid-template-columns:minmax(0,1fr)}}.flow li{{min-height:auto}}.flow li::after{{display:none!important}}.section-head{{display:block}}.doc-link{{margin-top:14px}}details.tech-detail>summary{{display:block}}details.tech-detail>summary small{{display:block;margin-top:5px}}.table-wrap{{overflow:visible}}table,thead,tbody,tr,th,td{{display:block;width:100%}}thead{{display:none}}tr{{padding:9px 12px;border-top:1px solid #e4eeec}}td,td:first-child{{display:grid;grid-template-columns:82px minmax(0,1fr);gap:8px;padding:3px 0;border:0;white-space:normal;overflow-wrap:anywhere}}td::before{{color:#718083;font:9px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}td:nth-child(1)::before{{content:"参数"}}td:nth-child(2)::before{{content:"来源 / 默认"}}td:nth-child(3)::before{{content:"作用"}}td:nth-child(4)::before{{content:"校验 / 兼容"}}button.secondary{{margin-left:0}}}}
     </style></head><body><div class="wrap"><section class="hero"><div style="font-size:12px;letter-spacing:.16em;color:#12d8bb;font-weight:800">ONE-CLICK LOCAL SERVICE</div><h1>三笙 · 电商商品分析引擎 V{SERVER_VERSION}</h1><div class="sub">单商品手动深采；类目不限，参数与SKU动态识别，评论可持续采集，也可随时基于当前数据开始分析。</div></section>
     <section class="card"><div class="status"><div class="pill">本地服务<br><span class="ok">运行正常 · V{SERVER_VERSION}</span></div><div class="pill">分析模型<br><span class="{'ok' if is_cfg else 'bad'}">{'已配置 '+model if is_cfg else '待配置'}</span></div><div class="pill">生图模型<br><span class="{'ok' if image_ok else 'bad'}">{'已配置 '+image_model if image_cfg else '待配置'}</span></div></div></section>
-    <section class="card workflow-card" id="image-workflow"><div class="section-head"><div><span class="eyebrow">ENGINEERING MAP · REAL RUNTIME</span><h2>生图工作流 · 研发速览</h2><p>提示词工作流程与参数解释：预览与正式生成共用提示词构建逻辑，报告事实先变成逐图任务，再经过一致性守卫组成最终提示词，调用生图接口并逐张保存。下方函数名可直接用于代码定位。</p></div><a class="doc-link" href="/prompts">查看 / 编辑提示词模板 →</a></div><p class="runtime-chain"><b>前端触发链</b><code>initPlanActions</code> → <code>refreshPromptPreview</code> → <code>/api/generate-images</code> → <code>pollJob</code>；后端再按槽位调用 <code>image_generate</code>，逐张写入 manifest。</p>
+    <section class="card workflow-card" id="image-workflow"><div class="section-head"><div><span class="eyebrow">ENGINEERING MAP · REAL RUNTIME</span><h2>生图工作流 · 研发速览</h2><p>弹窗只读取默认图位并本地编辑要求；确认提交后，后台解析用户意图一次、组装逐图提示词，再调用生图接口并逐张保存。Demo 未接入积分计费与余额校验。</p></div><a class="doc-link" href="/prompts">查看 / 编辑提示词模板 →</a></div><p class="runtime-chain"><b>前端触发链</b><code>initPlanActions</code> → <code>/api/image-generation-setup</code> → <code>/api/generate-images</code> → <code>pollJob</code>；后台按槽位调用 <code>image_generate</code>，逐张写入 manifest。</p>
     <ol class="flow"><li><b>读取报告与方案</b><small>从报告文件或请求体读取真实商品事实，按 <code>planIndex</code> 选择“下一款方向”。</small><span class="code-name">_load_report_for_generation</span></li><li><b>拆成逐图任务</b><small>提供主图 5 位、详情图 15 位；弹窗默认选择主图 5 位 + 详情前 6 位。</small><span class="code-name">build_generation_slots</span></li><li><b>确定起始产品基准</b><small>用户上传最多 4 张优先；否则取采集到的第一张商品主图。明确的用户商品设定可覆盖对应字段。</small><span class="code-name">resolve_reference_images</span></li><li><b>组装与校验提示词</b><small>注入身份锁、报告参数、用户最终设定、方案、单图任务和禁区；视觉要求再按槽位相关性分配。</small><span class="code-name">build_image_prompt + merge_image_prompt_with_user_edit</span></li><li><b>调用生图渠道</b><small>把最终 prompt、模型、尺寸、数量和参考图发给 OpenAI-compatible 接口。</small><span class="code-name">image_generate</span></li><li><b>落盘与一致性复核</b><small>兼容 URL / Base64 返回；每完成一张即保存图片与任务清单，最后标记人工复核。</small><span class="code-name">_persist_image_job + consistencyGate</span></li></ol>
     <div class="runtime-strip"><div class="runtime-item"><b>当前真实端点</b>{image_endpoint}</div><div class="runtime-item"><b>渠道选择</b>{html.escape(image_channel_label)}</div><div class="runtime-item"><b>固定出图尺寸</b>主图 1024×1024<br>详情图 1024×1536</div><div class="runtime-item"><b>单任务与容错</b>每槽位 n=1<br>超时 {request_timeout}s · 重试 {request_retries} 次</div></div>
     <div class="dev-grid"><section class="dev-panel"><header><h3>最终提示词怎样组成</h3><p>这是实际拼装顺序，不展示模型的隐藏推理过程。</p></header><ol class="prompt-stack"><li><div><b>统一产品身份锁 <code>identityLock</code></b><span>报告商品与参数作为默认基准；全局明确商品修改写入 <code>productOverrides</code>，整套图共享同一最终 identityId。</span></div></li><li><div><b>参考图规则</b><span>uploaded / collected / fission 决定起始外观；用户明确指定的商品字段优先覆盖参考图对应默认字段。</span></div></li><li><div><b>全局用户方向</b><span>明确的材质、颜色、结构、规格等商品设定作用于整套图；视觉要求按槽位相关性分配；品牌、交易、认证等禁区被拦截。</span></div></li><li><div><b>开品方案与爆款表达</b><span>注入方案名称、产品动作、页面动作；只借鉴高转化表达方法，不复制竞品。</span></div></li><li><div><b>当前图片默认任务</b><span>注入 assetType、index、role、task 与 handoff；用户没有明确覆盖时，继续执行本图默认信息任务。</span></div></li><li><div><b>事实、视觉与构图约束</b><span>类目、受众、页面实采参数提供默认值；视觉信号、尺寸和平台硬性禁区共同收口。</span></div></li><li><div><b>模板包裹与单图编辑 <code>promptMerge</code></b><span><code>image_generation</code> 用 <code>{{prompt}}</code> 注入内置提示词；商品字段编辑直接提权，视觉编辑需与本图相关，不相关内容保留默认策划。</span></div></li></ol><p class="formula">basePrompt → image_generation.replace("{{prompt}}", basePrompt) → relevanceGuard(promptOverride) → finalPrompt</p></section>
@@ -2040,6 +2387,15 @@ class H(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_response(204);self.cors();self.end_headers()
     def do_POST(self):
         global MODEL_PROBE, MODEL_PROBE_AT
+        if self.path=='/api/image-reference-upload':
+            try:
+                n=int(self.headers.get('Content-Length','0'))
+                if n<=0 or n>13*1024*1024: raise ValueError('参考图请求超过大小限制')
+                data=json.loads(self.rfile.read(n).decode('utf-8'))
+                url=save_generation_reference(data.get('image') if isinstance(data,dict) else None)
+                self.send_json({'ok':True,'url':url})
+            except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
+            return
         if self.path=='/api/prompts':
             try:
                 n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
@@ -2115,23 +2471,113 @@ class H(BaseHTTPRequestHandler):
         if self.path=='/api/generate-images':
             try:
                 n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
+                # A revision is a new generation request for one existing slot,
+                # never an image-edit operation. Rehydrate the original task
+                # context first, then allow the caller's edited requirements
+                # to override only the fields it explicitly supplied.
+                revision_of_job_id=str(data.get('revisionOfJobId') or '').strip()
+                parent_result_id=str(data.get('parentResultId') or '').strip()
+                parent_job=_load_image_job(revision_of_job_id) if revision_of_job_id else None
+                parent_result=None
+                if parent_job and parent_result_id:
+                    parent_result=next((item for item in parent_job.get('results') or [] if isinstance(item,dict) and str(item.get('resultId') or '')==parent_result_id),None)
+                    # Older checkpoints predate resultId. The history UI uses
+                    # a stable job:assetType:slotIndex fallback so those
+                    # records can still become the parent of a new version.
+                    if not parent_result and parent_result_id.startswith(revision_of_job_id+':'):
+                        fallback_parts=parent_result_id.split(':',2)
+                        if len(fallback_parts)==3:
+                            parent_result=next((item for item in parent_job.get('results') or []
+                                                if isinstance(item,dict)
+                                                and str(item.get('assetType') or '')==fallback_parts[1]
+                                                and str(item.get('slotIndex') or '')==fallback_parts[2]),None)
+                            if parent_result:
+                                parent_result_id=str(parent_result.get('resultId') or parent_result_id)
+                if revision_of_job_id:
+                    if not parent_job: raise ValueError('原生成任务不存在，无法进行二次生成')
+                    if not parent_result: raise ValueError('原图片版本不存在，无法进行二次生成')
+                    parent_chain=_revision_job_chain(parent_job)
+                    data['source']=str(_revision_job_value(parent_chain,'reportSource','') or '')
+                    data['planIndex']=int(_revision_job_value(parent_chain,'planIndex',0) or 0)
+                    # A revision is generated in the parent image's current
+                    # mode. The edit text may change, but the identity,
+                    # reference-display and fission branches must not drift
+                    # because the history UI or a stale client omitted them.
+                    data['referenceImages']=_revision_reference_images(parent_job)
+                    data['matchReferenceShooting']=bool(_revision_job_value(parent_chain,'matchReferenceShooting',False))
+                    data['fissionPattern']=bool(_revision_job_value(parent_chain,'fissionPattern',False))
+                    data['userDirection']=_revision_job_value(parent_chain,'userDirection','') or ''
+                    inherited_overrides=_revision_job_value(parent_chain,'promptOverrides',{})
+                    inherited_overrides=inherited_overrides if isinstance(inherited_overrides,dict) else {}
+                    requested_overrides=data.get('promptOverrides') if isinstance(data.get('promptOverrides'),dict) else {}
+                    data['promptOverrides']={**inherited_overrides,**requested_overrides}
+                    data['reuseAnalysisJobId']=revision_of_job_id
+                    task_key=_result_task_key(parent_result)
+                    data['selectedSlots']=[task_key]
+                    data['assetTypes']=[parent_result.get('assetType') or task_key.split(':',1)[0]]
+                    data['completeSet']=True
+                    data['imageModels']=[{'id':parent_result.get('model') or '', 'quality':parent_result.get('quality') or ''}]
+                    if data['fissionPattern'] and task_key!='main:1':
+                        fission_base=_revision_fission_base(parent_job,parent_result)
+                        if not fission_base: raise ValueError('原批次裂变基准图不存在，无法保持原商品设定重新生成')
+                        data['fissionBaseReference']=fission_base
+                    data['revisionNumber']=max(_next_result_revision_number(parent_job,parent_result),int(data.get('revisionNumber') or 0))
+                    data['rootResultIds']={task_key:parent_result.get('rootResultId') or f"root_{uuid.uuid4().hex[:12]}"}
+                    data['revisionReason']=str(data.get('revisionReason') or '').strip()
+                    if not data['revisionReason']:
+                        data['reusePrompt']=str(parent_result.get('prompt') or '').strip()
                 report=_load_report_for_generation(data)
                 exp=report.get('experienceSolution') or {}; plans=(exp.get('newProductPlans') or {}).get('plans') or report.get('launchPlans',{}).get('plans') or []
                 if not plans: raise ValueError('报告没有可执行的新品推荐方案')
                 idx=int(data.get('planIndex',0));
                 if idx<0 or idx>=len(plans): raise ValueError('方案索引无效')
+                chosen=plans[idx]
+                resolve_reference_images(report,chosen,data.get('referenceImages'))
+                available={f"{slot['assetType']}:{slot['index']}" for slot in build_generation_slots(report,chosen)}
+                selected=data.get('selectedSlots') or []
+                if selected and (not isinstance(selected,list) or any(key not in available for key in selected)):
+                    raise ValueError('所选图片任务无效，请重新打开弹窗')
                 job_id='img_'+time.strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:8]
+                generation_round_id=(
+                    str((parent_job or {}).get('generationRoundId') or
+                        (parent_job or {}).get('roundId') or
+                        revision_of_job_id or job_id)
+                )
+                round_type='revision' if revision_of_job_id else 'initial'
                 match_reference_shooting=_match_reference_shooting(data, False)
-                chosen=plans[idx]; product=(report.get('facts') or {}).get('product') or {}
+                product=(report.get('facts') or {}).get('product') or {}
                 IMAGE_JOBS[job_id]={'jobId':job_id,'status':'queued','progress':5,'results':[],'createdAt':time.time(),
                                     'planName':chosen.get('name') or '未命名开品方案',
                                     'productName':product.get('title') or '商品','reportSource':str(data.get('source') or ''),
+                                    'planIndex':idx,'referenceImages':list(data.get('referenceImages') or []) if isinstance(data.get('referenceImages'),list) else [],
                                     'matchReferenceShooting':match_reference_shooting,
-                                    'referenceShootingPolicy':'match_reference' if match_reference_shooting else 'identity_only'}
+                                    'referenceShootingPolicy':'match_reference' if match_reference_shooting else 'identity_only',
+                                    'revisionOfJobId':revision_of_job_id,'parentResultId':parent_result_id,
+                                    'revisionReason':str(data.get('revisionReason') or '').strip(),
+                                    'revisionNumber':max(1,int(data.get('revisionNumber') or 1)),
+                                    'rootResultIds':data.get('rootResultIds') if isinstance(data.get('rootResultIds'),dict) else {},
+                                    'promptOverrides':data.get('promptOverrides') if isinstance(data.get('promptOverrides'),dict) else {},
+                                    'userDirection':data.get('userDirection') or '',
+                                    'generationRoundId':generation_round_id,
+                                    'roundType':round_type}
+                data['generationRoundId']=generation_round_id
+                data['roundType']=round_type
+                _persist_image_job(job_id,IMAGE_JOBS[job_id])
                 threading.Thread(target=_generation_worker,args=(job_id,report,data),daemon=True).start()
                 self.send_json({'ok':True,'jobId':job_id,'statusUrl':f'/api/image-job/{job_id}',
                                 'matchReferenceShooting':match_reference_shooting,
                                 'referenceShootingPolicy':'match_reference' if match_reference_shooting else 'identity_only'})
+            except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
+            return
+        if self.path=='/api/image-generation-setup':
+            try:
+                n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
+                report=_load_report_for_generation(data)
+                # Setup is deterministic and read-only: no intent analysis or prompt construction.
+                self.send_json(image_generation_setup(
+                    report,data.get('planIndex',0),data.get('referenceImages'),
+                    _match_reference_shooting(data,False),data.get('fissionPattern'),
+                ))
             except Exception as e: self.send_json({'ok':False,'error':str(e)},400)
             return
         if self.path=='/api/image-prompt-preview':
@@ -2249,6 +2695,18 @@ class H(BaseHTTPRequestHandler):
             except Exception as e: self.send_json({'ok':False,'error':str(e)},500); return
         if p.startswith('/api/task/'):
             tid=p.rsplit('/',1)[-1]; t=TASKS.get(tid); self.send_json(t if t else {'error':'task not found'},200 if t else 404); return
+        if re.fullmatch(r'/api/report-export/[A-Za-z0-9_-]+',p):
+            report_id=p.rsplit('/',1)[-1]
+            try:
+                document=build_offline_report(report_id)
+                self.send_bytes(document,'text/html; charset=utf-8',f'{report_id}-offline.html')
+            except FileNotFoundError as e:
+                self.send_json({'ok':False,'error':str(e)},404)
+            except ValueError as e:
+                self.send_json({'ok':False,'error':str(e)},409)
+            except Exception as e:
+                self.send_json({'ok':False,'error':f'离线报告制作失败：{e}'},500)
+            return
         if re.fullmatch(r'/api/image-job/[^/]+/download',p):
             jid=p.split('/')[-2]
             try:
@@ -2280,7 +2738,10 @@ class H(BaseHTTPRequestHandler):
         if p=='/api/image-jobs':
             source=(parse_qs(urlparse(self.path).query).get('source') or [''])[0]
             jobs={k:dict(v) for k,v in IMAGE_JOBS.items()}
-            for saved in REPORTS.glob('generated_img_*.json'):
+            # Checkpoints are named generated_<jobId>.json. Keep persisted
+            # history visible after a local service restart as well as in-memory
+            # jobs created by the current process.
+            for saved in REPORTS.glob('generated_*.json'):
                 try:
                     item=json.loads(saved.read_text('utf-8'))
                     if isinstance(item,dict) and item.get('jobId'): jobs[item['jobId']]=item
@@ -2301,6 +2762,9 @@ class H(BaseHTTPRequestHandler):
         if p.startswith('/reports/'):
             f=(REPORTS/p.split('/reports/',1)[1]).resolve()
             if REPORTS.resolve() not in f.parents:self.send_error(403);return
+            # 兼容历史报告链接中遗漏 .json 后缀的情况。
+            if not f.exists() and f.suffix=='' and f.with_suffix('.json').exists():
+                f=f.with_suffix('.json')
             ctype=mimetypes.guess_type(str(f))[0] or 'application/octet-stream'
             if f.suffix=='.json':ctype='application/json; charset=utf-8'
             elif f.suffix=='.html':ctype='text/html; charset=utf-8'
