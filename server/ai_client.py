@@ -105,10 +105,10 @@ def _headers(c):
     return h
 
 def image_channel(c=None):
-    """Return an image-provider config, falling back to the analysis channel for compatibility."""
+    """Return the independently configured image provider; never borrow analysis credentials."""
     source=dict(c or load_config())
-    source['api_base']=str(source.get('image_api_base') or source.get('api_base') or '').rstrip('/')
-    source['api_key']=str(source.get('image_api_key') or source.get('api_key') or '')
+    source['api_base']=str(source.get('image_api_base') or '').rstrip('/')
+    source['api_key']=str(source.get('image_api_key') or '')
     source['models_path']=str(source.get('image_models_path') or '/models')
     return source
 

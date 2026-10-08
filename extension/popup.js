@@ -1,7 +1,7 @@
 const SERVER='http://127.0.0.1:17962';
 const EXPECTED_SERVER_VERSION='9.3.0';
 let backendCompatible=false;
-const server=document.getElementById('server'),status=document.getElementById('status'),bar=document.getElementById('bar'),runBtn=document.getElementById('run'),stopBtn=document.getElementById('stop'),reviewLive=document.getElementById('reviewLive'),liveCount=document.getElementById('liveCount'),liveNet=document.getElementById('liveNet'),liveRound=document.getElementById('liveRound'),liveStagnant=document.getElementById('liveStagnant'),liveMode=document.getElementById('liveMode'),liveElapsed=document.getElementById('liveElapsed'),livePreview=document.getElementById('livePreview');
+const server=document.getElementById('server'),status=document.getElementById('status'),bar=document.getElementById('bar'),runBtn=document.getElementById('run'),stopBtn=document.getElementById('stop'),reviewLive=document.getElementById('reviewLive'),liveCount=document.getElementById('liveCount'),liveElapsed=document.getElementById('liveElapsed'),livePreview=document.getElementById('livePreview');
 const paramLive=document.getElementById('paramLive'),paramState=document.getElementById('paramState'),paramCount=document.getElementById('paramCount'),paramTags=document.getElementById('paramTags'),paramMissing=document.getElementById('paramMissing');
 const analysisModelState=document.getElementById('analysisModelState'),imageModelState=document.getElementById('imageModelState');
 function modelStatus(configured,model,probe){
@@ -29,7 +29,7 @@ async function refresh(){
    if(imageModelState){imageModelState.textContent=image.text;imageModelState.className=image.className}
  }else{
    const analysis=modelStatus(h.modelConfigured,h.model,h.modelProbe?.ok===true),image=modelStatus(h.imageModelConfigured,h.imageModel,h.imageProbe?.ok===true);
-   server.textContent=`本地服务 ✓ V${h.serverVersion} · 分析${analysis.text} · 生图${image.text}`;
+   server.textContent='本地服务已连接 ✓';
    server.className='state ok';
    if(analysisModelState){analysisModelState.textContent=analysis.text;analysisModelState.className=analysis.className}
    if(imageModelState){imageModelState.textContent=image.text;imageModelState.className=image.className}
@@ -45,7 +45,7 @@ async function refresh(){
      paramTags.innerHTML=(ps.keys||[]).slice(0,10).map(k=>`<span class="param-tag">${String(k).replace(/[<>&]/g,s=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</span>`).join('')||'<span class="param-tag">暂无</span>';
      paramMissing.textContent='缺失项：'+((ps.missing||[]).length?(ps.missing.join('、')):'无');
    }
-   if(lp){liveCount.textContent=lp.count??0;liveNet.textContent=lp.networkReviewObjects??0;liveRound.textContent=lp.round??0;liveStagnant.textContent=lp.stagnant??0;liveMode.textContent=lp.mode||'—';liveElapsed.textContent=Math.round((lp.elapsedMs||0)/1000)+'s';livePreview.innerHTML=(lp.preview||[]).map((x,i)=>`<div>${i+1}. ${String(x).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`).join('')||'等待评论数据…'}}else{status.textContent='已识别当前商品，等待手动开始。';bar.style.width='0%';runBtn.textContent='开始深度采集';stopBtn.style.display='none';reviewLive.style.display='none'}
+   if(lp){liveCount.textContent=lp.count??0;liveElapsed.textContent=Math.round((lp.elapsedMs||0)/1000)+'s';livePreview.innerHTML=(lp.preview||[]).map((x,i)=>`<div>${i+1}. ${String(x).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`).join('')||'等待评论数据…'}}else{status.textContent='已识别当前商品，等待手动开始。';bar.style.width='0%';runBtn.textContent='开始深度采集';stopBtn.style.display='none';reviewLive.style.display='none'}
 }
 let collectionMode='500';
 const sampleButtons=[...document.querySelectorAll('[data-sample]')];
@@ -58,8 +58,6 @@ runBtn.onclick=async()=>{
  const t=await active();let sample=collectionMode;if(sample==='custom'){const n=Number(customSample?.value||0);if(!Number.isInteger(n)||n<1||n>10000){status.textContent='请输入 1-10000 的评论数量';return}sample=String(n)}status.textContent=`开始采集当前商品（评论样本 ${sample==='all'?'全部':sample+' 条'}）…`;try{const r=await chrome.runtime.sendMessage({type:'RUN_CURRENT',tabId:t.id,sampleMode:sample});if(r?.needsReviewResume){status.textContent=r.message||'评论采集已暂停，可继续';runBtn.textContent='继续采集评论'}else if(!r?.ok){status.textContent='采集失败：'+(r?.error||'未知错误')}}catch(e){status.textContent='采集失败：'+String(e)}setTimeout(refresh,500)};
 document.getElementById('install').onclick=()=>chrome.tabs.create({url:chrome.runtime.getURL('install.html')});
 document.getElementById('open').onclick=()=>chrome.tabs.create({url:SERVER+'/'});
-document.getElementById('openWorkflow').onclick=()=>chrome.tabs.create({url:SERVER+'/#image-workflow'});
-document.getElementById('openPrompts').onclick=()=>chrome.tabs.create({url:SERVER+'/prompts'});
 document.getElementById('importMonitor')?.addEventListener('click',()=>document.getElementById('monitorFile')?.click());
 document.getElementById('monitorFile')?.addEventListener('change',async e=>{
  const f=e.target.files?.[0];if(!f)return;

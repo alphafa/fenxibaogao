@@ -188,7 +188,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
             app.IMAGE_JOBS.pop(second)
 
     def test_image_model_is_independent_and_required(self):
-        with patch('ai_client.load_config', return_value={'api_key': 'test', 'model': 'text-only', 'image_model': '', '_config_error': ''}):
+        with patch('ai_client.load_config', return_value={'api_key': 'test', 'image_api_key': 'image-test', 'image_api_base': 'https://image.example/v1', 'model': 'text-only', 'image_model': '', '_config_error': ''}):
             with self.assertRaisesRegex(RuntimeError, '独立的生图模型'):
                 app.image_generate('test')
 
@@ -204,28 +204,73 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('image_generation', prompt_page)
         self.assertIn('{prompt}', prompt_page)
 
-    def test_configuration_page_explains_real_image_workflow_and_parameters(self):
-        config = {
-            'api_base': 'https://text.example/v1', 'api_key': 'analysis-secret', 'model': 'text-model',
-            'image_api_base': '', 'image_api_key': '', 'image_model': 'image-model',
-            'image_path': '/images/generations', 'timeout': 120, 'retries': 2, '_config_error': '',
-        }
-        with patch.object(app, 'load_config', return_value=config), patch.object(app, 'configured', return_value=False):
-            page = app.control_page()
-        for text in (
-            '生图工作流 · 研发速览', '弹窗只读取默认图位并本地编辑要求', '_load_report_for_generation', 'build_generation_slots',
-            'resolve_reference_images', 'build_image_prompt + merge', 'image_generate', 'initPlanActions', '/api/image-generation-setup', 'pollJob',
-            '最终提示词怎样组成', '业务请求参数', '生图接口参数与返回',
-            '主图 5 位 + 详情前 6 位', 'main:1', '{prompt}', 'image_models_path', 'jobId / statusUrl', 'GET status',
-            'https://text.example/v1/images/generations', '各字段',
-        ):
+    def test_configuration_page_keeps_user_settings_without_engineering_content(self):
+        page = app.control_page()
+        for text in ('分析渠道', '生图渠道', '保存并测试连接', 'imageModel', '高级设置'):
             self.assertIn(text, page)
-        self.assertIn('class="ok">已配置 image-model', page)
-        # The API contract table is intentionally visible on first load so an
-        # engineer can inspect the request/response fields without another
-        # click (the business-request table remains visible as well).
-        self.assertIn('details class="tech-detail" open><summary>生图接口参数与返回', page)
-        self.assertNotIn('analysis-secret', page)
+        for text in ('研发速览', 'ENGINEERING MAP', '业务请求参数', '生图接口参数与返回',
+                     'identityLock', 'promptMerge', 'href="/prompts"', '前端触发链'):
+            self.assertNotIn(text, page)
+        popup = (ROOT / 'extension' / 'popup.html').read_text()
+        for text in ('研发速览', 'openWorkflow', 'openPrompts', '网络对象', '提示词七层'):
+            self.assertNotIn(text, popup)
+        for text in ('id="run"', 'id="analyzeNow"', 'id="analysisModelState"'):
+            self.assertIn(text, popup)
+
+    def test_connection_errors_show_actionable_copy_without_provider_payload(self):
+        message = app.connection_message('{"error":{"code":"invalid_api_key"},"request_id":"private-id"}')
+        self.assertIn('密钥验证失败', message)
+        self.assertNotIn('private-id', message)
+        self.assertNotIn('request_id', message)
+        self.assertIn('超时', app.connection_message('timed out'))
+
+    def test_missing_image_models_have_specific_validation_message(self):
+        message = app.model_test_message({'ok': True}, {'ok': True, 'allImageModelsFound': False,
+            'imageModels': [{'id': 'available', 'found': True}, {'id': 'missing-model', 'found': False}]})
+        self.assertIn('missing-model', message)
+        self.assertNotIn('available', message)
+        self.assertEqual('', app.model_test_message({'ok': True}, {'ok': True}))
+
+    def test_image_channel_never_borrows_analysis_credentials(self):
+        from ai_client import image_channel
+        channel = image_channel({'api_base': 'https://analysis.example/v1', 'api_key': 'analysis-secret',
+                                 'image_api_base': 'https://images.example/v1'})
+        self.assertEqual('', channel['api_key'])
+        channel = image_channel({'api_base': 'https://analysis.example/v1', 'api_key': 'analysis-secret'})
+        self.assertEqual('', channel['api_base'])
+        self.assertEqual('', channel['api_key'])
+
+    def test_partial_config_save_preserves_other_channel_and_settings(self):
+        old = {'api_base': 'https://analysis.example/v1', 'api_key': 'analysis-secret', 'model': 'text-model',
+               'image_api_base': 'https://image.example/v1', 'image_api_key': 'image-secret',
+               'image_model': 'image-model', 'timeout': 77, 'extra_headers': {'X-Test': 'value'}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'ROOT', Path(tmp)):
+            path = Path(tmp) / 'config.json'
+            path.write_text(json.dumps(old))
+            saved = app.save_config({'image_model': 'new-image-model'})
+            for key in ('api_base', 'api_key', 'model', 'image_api_key', 'timeout', 'extra_headers'):
+                self.assertEqual(old[key], saved[key])
+            saved = app.save_config({'api_key': 'new-analysis-secret'})
+            self.assertEqual('image-secret', saved['image_api_key'])
+            saved = app.save_config({'image_api_key': 'new-image-secret'})
+            self.assertEqual('new-analysis-secret', saved['api_key'])
+        page = app.control_page()
+        self.assertIn('id="editAnalysisKey"', page)
+        self.assertIn('id="editImageKey"', page)
+        self.assertIn('autocomplete="new-password" disabled', page)
+
+    def test_history_summary_preserves_model_versions_without_large_payloads(self):
+        state = {'jobId': 'img_test', 'reportSource': '/reports/example.json', 'status': 'complete',
+                 'results': [{'url': '/reports/test.png', 'sourceUrl': 'data:image/png;base64,' + 'x'*100000,
+                              'prompt': 'private-large-prompt', 'modelKey': 'model_one', 'assetType': 'main',
+                              'slotIndex': 1, 'resultId': 'result_one', 'revisionNumber': 2}]}
+        summary = app.image_history_summary(state)
+        self.assertEqual('model_one', summary['results'][0]['modelKey'])
+        self.assertEqual('result_one', summary['results'][0]['resultId'])
+        self.assertNotIn('sourceUrl', summary['results'][0])
+        self.assertLess(len(json.dumps(summary)), 1000)
+        script = (ROOT / 'server' / 'report.js').read_text()
+        self.assertIn('await pollJob(lastSubmittedJobId)', script)
 
     def test_image_channel_can_override_analysis_provider(self):
         from ai_client import image_channel
@@ -314,7 +359,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('统一收录在底部完整分析区', script)
         self.assertIn('本次生成参数', script)
         self.assertIn('请求质量', script)
-        self.assertIn('generation-task-result-meta', script)
+        self.assertIn('generation-task-spec', script)
         self.assertIn('质量：${modelQuality(item)}', script)
 
     def test_engineering_validation_has_chinese_display_dictionary(self):
@@ -335,7 +380,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('task-final-prompt', script)
         self.assertIn('商品材质、颜色、结构等修改会同步整套图片', script)
         self.assertIn('reuseAnalysisJobId', script)
-        self.assertIn('本图已关联并优先融合全局用户要求', script)
+        self.assertNotIn('generation-prompt-status', script)
         self.assertIn('商品材质、颜色、结构等修改会同步整套图片', script)
         self.assertIn('用户最终要求', script)
         self.assertNotIn('prompt:promptOverrides[key]||', script)
@@ -962,7 +1007,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('orderedResults(job.results)', script)
         self.assertIn('selectedSlotKeys=new Set(failedSlots.map', script)
         self.assertIn('仅重试失败：${countText(counts)}', script)
-        self.assertIn('点击按钮仅重试失败槽位', script)
+        self.assertIn('点击按钮重试失败图片', script)
         self.assertIn('部分完成 · 失败 ${failedCount} 张', script)
 
     def test_worker_generates_every_slot_and_persists_manifest(self):
@@ -1190,7 +1235,7 @@ class ImageGenerationFlowTest(unittest.TestCase):
         self.assertIn('data-generation-history-fullscreen aria-pressed="true"', script)
         self.assertIn('data-history-version-step', script)
         self.assertIn('data-history-version-label', script)
-        self.assertIn("本次沿用已确认提示词", script)
+        self.assertIn("本次沿用上次要求", script)
         self.assertNotIn("请先填写本次需要调整的内容。", script)
         self.assertIn('displayRevisionNumber:index+1', script)
         self.assertIn('Number(a.createdAt||0)-Number(b.createdAt||0)', script)

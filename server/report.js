@@ -3,9 +3,22 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp
 const arr = value => Array.isArray(value) ? value : [];
 const compact = value => arr(value).map(item => typeof item === 'object' ? (item.value || item.topic || item.name || item.label || item.action || item.insight || '') : item).filter(Boolean).join(' · ');
 const percent = value => `${(Number(value || 0) * 100).toFixed(1).replace('.0','')}%`;
-const modelLabel = item => item?.modelLabel || item?.model || '默认生图模型';
+const modelLabel = item => item?.modelLabel || item?.label || item?.model || item?.id || '默认生图模型';
 const modelQuality = item => item?.quality || '服务商默认';
 const IMAGE_QUALITY_OPTIONS = ['auto','low','medium','high','xhigh','max'];
+function imageGenerationError(error) {
+  const text=String(error||'');
+  if (/content_safety|content safety|HTTP 451/i.test(text)) return '此图片请求被服务商内容审核拒绝。请检查图片要求和参考图后重试，其他图片继续生成。';
+  if (/HTTP 401|invalid token|invalid_api_key/i.test(text)) return '生图密钥验证失败，请检查生图渠道配置。';
+  if (/HTTP 429|rate.limit|quota/i.test(text)) return '生图服务暂时受限，请稍后重试或检查账户额度。';
+  if (/timeout|timed out|超时/i.test(text)) return '生图请求超时，请稍后重试。';
+  return text ? '此图片生成失败，请稍后重试。' : '';
+}
+function mergeAvailableImageModels(available, runModels) {
+  const options = new Map(arr(available).map(item => [item.id, {...item}]));
+  arr(runModels).forEach(item => options.set(item.id, {...options.get(item.id), ...item}));
+  return [...options.values()];
+}
 const resultSortKey = item => {
   const type = item?.assetType === 'main' ? 0 : 1;
   const index = Number(item?.slotIndex || 0);
@@ -378,7 +391,7 @@ function initPlanActions(plans, context={}) {
     .filter(item=>selectedImageModels.has(item.id))
     .map(item=>({...item,quality:selectedImageQualities.get(item.id) ?? item.quality ?? ''}));
   const comparisonMode=()=>selectedImageModels.size>1;
-  const modelKey=item=>item?.modelKey||item?.model||'default';
+  const modelKey=item=>item?.modelKey||item?.model||item?.id||'default';
   const imageModelControls=()=>dialog.querySelector('[data-image-model-controls]');
   const generationRunSummary=()=>dialog.querySelector('[data-generation-run-summary]');
   const renderGenerationRunSummary=(status='queued',specs=submittedModelSpecs)=>{
@@ -390,7 +403,7 @@ function initPlanActions(plans, context={}) {
       summary.innerHTML='';
       return;
     }
-    const stateLabel=status==='complete'?'已完成':status==='error'?'生成失败':status==='running'?'生成中':'已提交';
+    const stateLabel=status==='complete'?'已完成':status==='error'?'生成失败':status==='running'?'生成中':status==='queued'?'待确认':'已提交';
     summary.hidden=false;
     summary.innerHTML=`<b>本次生成参数 · ${stateLabel}</b>${items.map(item=>`<span><strong>${esc(item.label||item.id||'默认生图模型')}</strong><small>模型：${esc(item.id||'默认')} · 请求质量：${esc(modelQuality(item))}${item.quality?'':'（实际档位由服务商决定）'}</small></span>`).join('')}`;
   };
@@ -495,22 +508,13 @@ function initPlanActions(plans, context={}) {
     }
     syncFissionControl();
     syncMatchReferenceControl(plan);
-    if (referenceHint) referenceHint.textContent=uploadedReferences.length?`已上传 ${uploadedReferences.length} 张产品图；第一张是整套图片唯一商品身份基准，其他上传图不会混入生图请求。开启展示状态一致后，采集商品对应图片只负责视角和摆放。`:(fallback.length?(fissionEnabled()?'默认先裂变生成相近花型基准图，后续主图/详情围绕该基准图生成。':'当前将直接参考采集商品主图生成。'):'当前没有商品主图，请上传产品图后生成。');
+    if (referenceHint) referenceHint.textContent=uploadedReferences.length?`已上传 ${uploadedReferences.length} 张产品图，以第一张为准。开启展示状态一致后，将参考原商品图片的视角和摆放。`:(fallback.length?(fissionEnabled()?'默认先裂变生成相近花型基准图，后续主图/详情围绕该基准图生成。':'当前将直接参考采集商品主图生成。'):'当前没有商品主图，请上传产品图后生成。');
   };
   const taskName=slot=>slot.role||`${slot.assetType==='detail'?'详情图':'主图'}任务 ${slot.index||''}`;
   const taskCard=(slot,result,status='queued')=>{
     const label=status==='complete'?'已完成':status==='generating'?'生成中':status==='error'?'生成失败':'等待生成';
     const key=slotKey(slot), hasUserEdit=Object.prototype.hasOwnProperty.call(promptOverrides,key);
     const promptText=hasUserEdit?promptOverrides[key]:'';
-    const mergeMode=slot.promptMerge?.mode;
-    const globalDirection=slot.userDirection||{};
-    const hasGlobalAccepted=arr(globalDirection.accepted).length>0;
-    const hasGlobalIgnored=arr(globalDirection.ignored).length>0;
-    const hasGlobalRejected=arr(globalDirection.rejected).length>0;
-    const mergeNote=mergeMode==='applied'?'本图已关联并优先融合本图编辑':
-      hasGlobalAccepted?'本图已关联并优先融合全局用户要求':
-      mergeMode==='ignored_unrelated'||hasGlobalIgnored||hasGlobalRejected?'本图未关联或存在不可执行要求，继续执行内置策划':
-      hasUserEdit||userDirection()?'提交后解析用户要求并组装提示词':'提交后组装本图提示词';
     const planContext=compact([slot.planProductAction,slot.planPageAction]);
     const planContextHtml=planContext?`<p class="generation-plan-context"><b>${esc(slot.planName||'当前开品方案')}</b> · ${esc(planContext)}</p>`:'';
     const showDisplayReference=matchReferenceShooting();
@@ -523,9 +527,8 @@ function initPlanActions(plans, context={}) {
         : `<div class="generation-task-placeholder"><span>${status==='error'?'FAILED':status==='generating'?'RUNNING':'待生成'}</span><b>${String(slot.index||1).padStart(2,'0')}</b></div>`;
     const media=`<div class="generation-task-state-media">${stateMedia}</div>`;
     const resultSpec=result?`<small class="generation-task-spec">${esc(modelLabel(result))} · 质量 ${esc(modelQuality(result))}</small>`:'';
-    const visibleResultSpec=result?`<div class="generation-task-result-meta"><b>本次实际请求</b>${resultSpec}</div>`:'';
     const choose=status==='queued'?`<label class="generation-slot-select"><input type="checkbox" data-select-slot="${esc(key)}" ${selectedSlotKeys.has(key)?'checked':''}><span>生成此图</span></label>`:'';
-    return `<article class="generation-task-card generation-task-${status} ${selectedSlotKeys.has(key)?'is-selected':''}" data-task-card="${esc(key)}"><div class="generation-task-media">${media}<i>${esc(label)}</i></div><div class="generation-task-info"><small>${slot.assetType==='detail'?'详情图':'主图'} ${String(slot.index||1).padStart(2,'0')}</small><h4>${esc(taskName(slot))}</h4>${planContextHtml}${resultSpec}${arr(slot.task).length?`<p>${arr(slot.task).map(esc).join(' · ')}</p>`:''}<p class="generation-prompt-status">${esc(mergeNote)}</p>${choose}<details class="task-prompt"><summary>编辑本张要求</summary><em>商品材质、颜色、结构等修改会同步整套图片；视觉要求仅在关联本图时融合。</em><textarea data-prompt-slot="${esc(key)}" placeholder="例如：改成天丝棉材质；或背景留白更大、改为面料微距特写">${esc(promptText)}</textarea></details></div>${visibleResultSpec}</article>`;
+    return `<article class="generation-task-card generation-task-${status} ${selectedSlotKeys.has(key)?'is-selected':''}" data-task-card="${esc(key)}"><div class="generation-task-media">${media}<i>${esc(label)}</i></div><div class="generation-task-info"><small>${slot.assetType==='detail'?'详情图':'主图'} ${String(slot.index||1).padStart(2,'0')}</small><h4>${esc(taskName(slot))}</h4>${planContextHtml}${resultSpec}${arr(slot.task).length?`<p>${arr(slot.task).map(esc).join(' · ')}</p>`:''}${choose}<details class="task-prompt"><summary>编辑本张要求</summary><em>商品材质、颜色、结构等修改会同步整套图片；视觉要求仅在关联本图时融合。</em><textarea data-prompt-slot="${esc(key)}" placeholder="例如：改成天丝棉材质；或背景留白更大、改为面料微距特写">${esc(promptText)}</textarea></details></div></article>`;
   };
   const openPreview=button=>{
     const buttons=[...generateResults.querySelectorAll('[data-preview-url]')];
@@ -535,7 +538,7 @@ function initPlanActions(plans, context={}) {
     const media=result?.url
       ? `<button class="generation-preview-btn" type="button" data-preview-url="${esc(result.url)}" data-preview-title="${esc(`${modelLabel(model)} · ${taskName(slot)}`)}"><img loading="lazy" src="${esc(result.url)}" alt="${esc(`${modelLabel(model)} · ${taskName(slot)}`)}"></button>`
       : `<div class="generation-task-placeholder"><span>${status==='error'?'FAILED':status==='generating'?'RUNNING':slot.assetType==='detail'?'DETAIL':'MAIN'}</span><b>${String(slot.index||1).padStart(2,'0')}</b></div>`;
-    const error=result?.error||'';
+    const error=imageGenerationError(result?.error);
     return `<article class="generation-comparison-cell generation-task-${status}"><header><b>${esc(modelLabel(model))}<small>${esc(modelQuality(model))}</small></b><i>${status==='complete'?'已完成':status==='generating'?'生成中':status==='error'?'失败':'等待生成'}</i></header><div class="generation-comparison-media">${media}</div>${error?`<p class="generation-error">${esc(error)}</p>`:''}</article>`;
   };
   const renderComparisonBoard=(slots,results=[],jobStatus='queued',failedSlots=[],models=selectedModelOptions())=>{
@@ -648,7 +651,9 @@ function initPlanActions(plans, context={}) {
     });
     refreshGenerationConfirmation();
   });
+  let activeJobPoll=0;
   const pollJob = async jobId => {
+    const pollToken=++activeJobPoll;
     let networkErrors=0;
     for (let i=0;i<240;i++) {
       const endpoint='/api/image-job/'+encodeURIComponent(jobId);
@@ -664,6 +669,7 @@ function initPlanActions(plans, context={}) {
         await new Promise(resolve=>setTimeout(resolve,Math.min(2000*networkErrors,6000)));
         continue;
       }
+      if (pollToken!==activeJobPoll) return;
       // A fission run may inject main:1 as the shared product baseline even
       // when the user selected detail-only slots. Keep that implicit asset in
       // the board so the UI mirrors the manifest and does not hide the image
@@ -671,8 +677,8 @@ function initPlanActions(plans, context={}) {
       const expected=arr(state.expectedSlots);
       if (arr(state.comparisonModels).length) {
         const runModels=arr(state.comparisonModels).map(item=>({id:item.id||'',label:item.label||item.id||'默认生图模型',quality:item.quality||'',modelKey:item.modelKey}));
-        imageModelOptions=runModels;
-        selectedImageModels=new Set(imageModelOptions.map(item=>item.id));
+        imageModelOptions=mergeAvailableImageModels(imageModelOptions,runModels);
+        selectedImageModels=new Set(runModels.map(item=>item.id));
         const preservedQualities=new Map(selectedImageQualities);
         runModels.forEach(item=>{
           if (item.quality || !preservedQualities.has(item.id)) preservedQualities.set(item.id,item.quality||'');
@@ -694,8 +700,8 @@ function initPlanActions(plans, context={}) {
       }
       const displayResults=mergeResults(retainedResults,state.results);
       const boardSlots=generatedTaskSlots.length?generatedTaskSlots:expected.length?expected:previewSlots;
-      if (state.status==='complete') { const gate=state.consistencyGate||{}; const shootPolicy=state.matchReferenceShooting?'已按参考图拍摄与产品展示状态生成。':'按每张图片任务重新设计拍摄和展示状态。'; const failedSlots=arr(state.failedSlots), failed=failedSlots.length; retainedResults=displayResults; if(failed){selectedSlotKeys=new Set(failedSlots.map(item=>`${item.assetType}:${item.slotIndex}`));const counts=generationCounts();if(generateButton){generateButton.disabled=false;generateButton.textContent=`仅重试失败：${countText(counts)}`;}syncTypeSwitches();} if(generateStatus) generateStatus.textContent=failed?`部分完成：累计成功 ${displayResults.length} 张，失败 ${failed} 张。点击按钮仅重试失败槽位。`:`已生成 ${displayResults.length} 张图片。${shootPolicy}${gate.status==='passed'?'一致性校验通过。':'已共享产品身份锁，发布前仍需完成一致性复核。'}`; renderTaskBoard(boardSlots,displayResults,'complete',failedSlots); return; }
-      if (state.status==='error') { renderTaskBoard(boardSlots,displayResults,'error',state.failedSlots); throw new Error(state.error||'生图失败'); }
+      if (state.status==='complete') { const gate=state.consistencyGate||{}; const shootPolicy=state.matchReferenceShooting?'已按参考图拍摄与产品展示状态生成。':'按每张图片任务重新设计拍摄和展示状态。'; const failedSlots=arr(state.failedSlots), failed=failedSlots.length; retainedResults=displayResults; if(failed){selectedSlotKeys=new Set(failedSlots.map(item=>`${item.assetType}:${item.slotIndex}`));const counts=generationCounts();if(generateButton){generateButton.disabled=false;generateButton.textContent=`仅重试失败：${countText(counts)}`;}syncTypeSwitches();} if(generateStatus) generateStatus.textContent=failed?`部分完成：累计成功 ${displayResults.length} 张，失败 ${failed} 张。点击按钮重试失败图片。`:`已生成 ${displayResults.length} 张图片。${shootPolicy}${gate.status==='passed'?'一致性校验通过。':'发布前请检查商品外观和文字。'}`; renderTaskBoard(boardSlots,displayResults,'complete',failedSlots); return; }
+      if (state.status==='error') { renderTaskBoard(boardSlots,displayResults,'error',state.failedSlots); throw new Error(imageGenerationError(state.error)||'生图失败'); }
       renderTaskBoard(boardSlots,displayResults,'running',state.failedSlots);
       const counts=generationCounts(); const expectedTotal=(counts.main+counts.detail)*Math.max(1,selectedImageModels.size); if (generateStatus) generateStatus.textContent=state.status==='queued'||state.status==='preparing'?'任务已提交，正在准备；可关闭页面，稍后在生成记录中查看。':`正在并发生成：已完成 ${arr(state.results).length} / ${expectedTotal} 张 · ${state.progress||0}%`;
       await new Promise(resolve=>setTimeout(resolve,1200));
@@ -710,7 +716,7 @@ function initPlanActions(plans, context={}) {
     if (!total) { if(generateStatus) generateStatus.textContent='尚未完成生成数量计算，请稍后再试。'; return; }
     const modelSpecs=selectedModelOptions(), requestTotal=total*Math.max(1,modelSpecs.length);
     submittedModelSpecs=modelSpecs.map(item=>({...item}));
-    renderGenerationRunSummary('running',submittedModelSpecs);
+    renderGenerationRunSummary('queued',submittedModelSpecs);
     const modelSummary=modelSpecs.map(item=>`${item.label||item.id}（${modelQuality(item)}）`).join('、');
     if (!window.confirm(`确认开始生成？\n\n模型：${modelSummary}\n主图：${counts.main} 张${fissionEnabled()&&counts.main?'（含裂变基准图 main:1）':''}\n详情图：${counts.detail} 张\n合计：${requestTotal} 张\n积分：此 Demo 未接入计费`)) {
       renderGenerationRunSummary('queued',[]);
@@ -718,12 +724,15 @@ function initPlanActions(plans, context={}) {
       return;
     }
     const submittedSlots=previewSlots.filter(slot=>selectedSlotKeys.has(slotKey(slot)));
+    ++activeJobPoll;
     event.currentTarget.disabled=true; if(generateStatus) generateStatus.textContent='正在提交生图任务…'; renderTaskBoard(submittedSlots,retainedResults,'running');
     try {
       const body={planIndex:activePlanIndex,assetTypes:types,selectedSlots:[...selectedSlotKeys],completeSet:true,imageModels:modelSpecs.map(item=>({id:item.id,quality:item.quality||''})),referenceImages:[...uploadedReferences],userDirection:userDirection(),fissionPattern:fissionEnabled(),matchReferenceShooting:matchReferenceShooting(),promptOverrides:{...promptOverrides},reuseAnalysisJobId:lastSubmittedJobId};
       if (context.source) body.source=context.source; else if (context.data) body.reportData=context.data;
       const response=await fetch('/api/generate-images',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}), payload=await readJsonResponse(response,'/api/generate-images');
       if (!response.ok || !payload.ok) throw new Error(payload.error||'无法提交生图任务');
+      generatedTaskSlots=submittedSlots.map(slot=>({...slot}));
+      retainedResults=[];
       lastSubmittedJobId=payload.jobId;
       localStorage.setItem(`sansong:last-image-job:${context.source||'embedded'}:${activePlanIndex}`,payload.jobId);
       if (generateStatus) generateStatus.textContent='任务已提交，正在准备；可关闭页面，稍后在生成记录中查看。';
@@ -824,12 +833,17 @@ function initPlanActions(plans, context={}) {
     if (generateResults) generateResults.replaceChildren();
     const setupBody={planIndex:activePlanIndex,referenceImages:[...uploadedReferences],matchReferenceShooting:!!matchReferenceInput?.checked,fissionPattern:fissionEnabled()};
     if (context.source) setupBody.source=context.source; else if (context.data) setupBody.reportData=context.data;
-    fetch('/api/image-generation-setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(setupBody)}).then(response=>readJsonResponse(response,'/api/image-generation-setup')).then(payload=>{
+    fetch('/api/image-generation-setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(setupBody)}).then(response=>readJsonResponse(response,'/api/image-generation-setup')).then(async payload=>{
       if (!payload.ok) throw new Error(payload.error||'默认图片任务加载失败');
       previewSlots=arr(payload.slots);
       // 默认保留完整主图链和前六个详情证明位；详情 7-15 可按需勾选。
       selectedSlotKeys=new Set(previewSlots.filter(slot=>slot.assetType==='main'||slot.index<=6).map(slotKey));
+      await loadImageModels();
       refreshGenerationConfirmation();
+      if (lastSubmittedJobId) {
+        if (generateStatus) generateStatus.textContent='正在恢复上次生成结果…';
+        await pollJob(lastSubmittedJobId);
+      }
     }).catch(error=>{if(generateStatus) generateStatus.textContent=error.message||'生成数量计算失败，请重新打开方案。'});
     if (typeof dialog.showModal === 'function') dialog.showModal(); else dialog.setAttribute('open','');
   }));
@@ -887,7 +901,7 @@ function openImagePreview(items,startIndex=0,openRevision=false,returnDialog=nul
   dialog.querySelector('[data-preview-revision-submit]').onclick=async()=>{
     const item=list[index], reason=String(revisionInput?.value||'').trim();
     if (!item?.resultId||!item?.jobId) return;
-    if (!window.confirm(`确认重新生成“${item.title||'当前图片'}”吗？\n\n${reason?'本次会合并你的补充要求。':'本次沿用已确认提示词。'}\n原版本不会被覆盖，会新增一个版本。`)) return;
+    if (!window.confirm(`确认重新生成“${item.title||'当前图片'}”吗？\n\n${reason?'本次会合并你的补充要求。':'本次沿用上次要求。'}\n原版本不会被覆盖，会新增一个版本。`)) return;
     const button=dialog.querySelector('[data-preview-revision-submit]'); button.disabled=true; revisionStatus.textContent='正在提交二次生成任务…';
     try {
       const overrides={...(item.promptOverrides||{})};

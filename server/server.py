@@ -1509,6 +1509,28 @@ def _load_report_for_generation(data):
     if not isinstance(obj,dict): raise ValueError('报告数据格式错误')
     return obj
 
+def image_history_summary(state):
+    """Keep history display and revision identities without large generation payloads."""
+    result_fields = {'url','assetType','slotIndex','model','modelLabel','modelKey','quality','taskKey',
+                     'resultId','revisionNumber','rootResultId','generationRoundId','roundType',
+                     'revisionReason','createdAt','displayReferenceUrl'}
+    fields = {'jobId','status','progress','planName','productName','reportSource','planIndex',
+              'createdAt','completedAt','revisionNumber','revisionOfJobId','parentResultId',
+              'revisionReason','rootResultIds','generationRoundId','roundType','matchReferenceShooting',
+              'referenceShootingPolicy','fissionPattern','userDirection','promptOverrides','error'}
+    summary = {k:v for k,v in state.items() if k in fields}
+    summary['results'] = [{k:v for k,v in item.items() if k in result_fields}
+                          for item in _ordered_generated_results(state.get('results') or [])]
+    return summary
+
+def _write_history_summary(job_id, state):
+    folder = REPORTS / '.image-history'
+    folder.mkdir(exist_ok=True)
+    target = folder / (job_id + '.json')
+    temporary = target.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(image_history_summary(state), ensure_ascii=False), 'utf-8')
+    temporary.replace(target)
+
 def _persist_image_job(job_id, state):
     """Checkpoint image work after every asset so a restart never hides returned images."""
     payload=dict(state or {})
@@ -1516,6 +1538,7 @@ def _persist_image_job(job_id, state):
         payload['results']=_ordered_generated_results(payload['results'])
     payload['jobId']=job_id
     (REPORTS/f'generated_{job_id}.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2),'utf-8')
+    _write_history_summary(job_id, payload)
 
 def _generation_intent_fingerprint(report, plan, slots, request, references):
     """Bind a reusable interpretation to the exact product, plan and inputs."""
@@ -2262,11 +2285,12 @@ def save_config(data):
         if not item.get('quality'):
             item['quality']=image_quality
     cfg={
+      **old,
       'api_base':str(data.get('api_base') or old.get('api_base') or 'https://api.bananarouter.com/v1').strip().rstrip('/'),
       'api_key':key,
       'model':str(data.get('model') or old.get('model') or 'gpt-5.5').strip(),
-      'chat_path':'/chat/completions','models_path':'/models','temperature':0.2,'timeout':120,'retries':2,
-      'ssl_verify':True,'ca_bundle':'','extra_headers':{},
+      'chat_path':old.get('chat_path','/chat/completions'),'models_path':old.get('models_path','/models'),'temperature':old.get('temperature',0.2),'timeout':old.get('timeout',120),'retries':old.get('retries',2),
+      'ssl_verify':True,'ca_bundle':old.get('ca_bundle',''),'extra_headers':old.get('extra_headers',{}),
       'image_model':legacy_image_model,
       'image_models':image_models,
       'image_api_base':str(data.get('image_api_base') or old.get('image_api_base') or '').strip().rstrip('/'),
@@ -2285,12 +2309,32 @@ def save_config(data):
     return cfg
 
 def _image_channel_label(config):
-    """Describe field-level fallback without exposing any API credential."""
-    image_base_set=bool(str((config or {}).get('image_api_base') or '').strip())
-    image_key_set=bool(str((config or {}).get('image_api_key') or '').strip())
-    if image_base_set and image_key_set: return '独立生图渠道'
-    if image_base_set or image_key_set: return '混合继承（部分字段复用分析渠道）'
-    return '复用分析渠道'
+    """Report independent image configuration readiness."""
+    if str((config or {}).get('image_api_base') or '').strip() and str((config or {}).get('image_api_key') or '').strip():
+        return '独立生图渠道'
+    return '生图渠道待配置'
+
+
+def connection_message(error):
+    text = str(error or '').lower()
+    if not text: return ''
+    if any(word in text for word in ('invalid_api_key', 'incorrect api key', 'unauthorized', '401')):
+        return '密钥验证失败，请检查 API Key 是否正确。'
+    if any(word in text for word in ('timeout', 'timed out', '超时')):
+        return '连接超时，请稍后重试。'
+    if any(word in text for word in ('429', 'rate_limit', 'quota', '余额', '额度')):
+        return '服务暂时受限，请检查账户额度或稍后重试。'
+    return '连接失败，请检查服务地址、密钥和模型设置。'
+
+def model_test_message(analysis, image):
+    if not analysis.get('ok'):
+        return '分析模型：' + connection_message(analysis.get('error'))
+    if not image.get('ok'):
+        return '生图模型：' + connection_message(image.get('error'))
+    if image.get('allImageModelsFound') is False:
+        missing = '、'.join(item['id'] for item in image.get('imageModels', []) if item.get('found') is False)
+        return '生图服务未提供以下模型：' + missing + '。请修改模型设置后重新测试。'
+    return ''
 
 def control_page():
     global MODEL_PROBE, MODEL_PROBE_AT
@@ -2312,12 +2356,12 @@ def control_page():
     )
     image_path=html.escape(str(c.get('image_path') or '/images/generations'))
     image_models_path=html.escape(str(c.get('image_models_path') or '/models'))
-    effective_image_base=str(c.get('image_api_base') or c.get('api_base') or '').rstrip('/')
+    effective_image_base=str(c.get('image_api_base') or '').rstrip('/')
     effective_image_path=str(c.get('image_path') or '/images/generations')
     image_endpoint=html.escape((effective_image_base+'/'+effective_image_path.lstrip('/')) if effective_image_base else '未配置')
     image_channel_label=_image_channel_label(c)
     image_cfg=bool(str(c.get('image_model') or '').strip())
-    effective_image_key=str(c.get('image_api_key') or c.get('api_key') or '').strip()
+    effective_image_key=str(c.get('image_api_key') or '').strip()
     image_ready=bool(image_cfg and effective_image_base and effective_image_key and not effective_image_key.startswith('YOUR_'))
     request_timeout=html.escape(str(c.get('timeout') or 120))
     request_retries=html.escape(str(c.get('retries') if c.get('retries') is not None else 2))
@@ -2325,31 +2369,23 @@ def control_page():
     # provider/model list probe below remains the source of truth for reachability.
     image_ok=image_ready
     cfg_err=html.escape(str(c.get('_config_error') or ''))
-    probe=html.escape(str(MODEL_PROBE.get('error') or ''))
+    probe=html.escape(connection_message(MODEL_PROBE.get('error')))
     key_state='已保存' if str(c.get('api_key') or '').strip() and not str(c.get('api_key')).startswith('YOUR_') else '未填写'
-    image_key_state='已单独保存' if str(c.get('image_api_key') or '').strip() else '未单独填写，当前复用分析渠道 Key'
+    image_key_state='已单独保存' if str(c.get('image_api_key') or '').strip() else '未填写'
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>三笙 · 电商商品分析闭环 V{SERVER_VERSION}</title><style>
     *{{box-sizing:border-box}}body{{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5faf9;color:#10191d;margin:0}}.wrap{{max-width:1160px;margin:54px auto;padding:0 24px 60px}}.hero{{background:#071114;color:#fff;padding:34px;border-radius:22px;border-top:5px solid #00cdb0}}h1{{font-size:38px;margin:0 0 10px}}h2{{letter-spacing:-.02em}}.sub{{color:#b9d0d4;line-height:1.65}}.card{{margin-top:18px;background:#fff;border:1px solid #dbe8e8;border-radius:18px;padding:24px}}.status{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}.pill{{padding:14px;border-radius:12px;background:#eef9f7;font-weight:700}}.ok{{color:#008c78}}.bad{{color:#c54552}}label{{display:block;font-size:13px;font-weight:700;margin:16px 0 7px}}input,textarea{{width:100%;padding:13px 14px;border:1px solid #bcd8d6;border-radius:10px;font-size:15px}}textarea{{min-height:108px;resize:vertical;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}}.field-help{{display:block;margin-top:6px;color:#6f7d80;font-size:12px;line-height:1.55;overflow-wrap:anywhere}}button{{margin-top:18px;border:0;border-radius:10px;padding:13px 18px;background:linear-gradient(110deg,#00cdb0,#008fd8);color:white;font-weight:800;font-size:15px;cursor:pointer}}button.secondary{{background:#071114;margin-left:8px}}#msg{{margin-top:12px;white-space:pre-wrap}}code{{background:#eaf7f5;padding:3px 6px;border-radius:5px;color:#087465;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}a{{color:#087f70}}.section-head{{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}}.section-head h2{{margin:4px 0 8px;font-size:28px}}.section-head p{{max-width:760px;margin:0;color:#667477;line-height:1.65}}.eyebrow{{color:#008f7a;font-size:11px;font-weight:900;letter-spacing:.14em}}.doc-link{{flex:0 0 auto;display:inline-flex;align-items:center;padding:9px 12px;border:1px solid #a9d7d0;border-radius:9px;background:#f1fbf9;font-size:12px;font-weight:800;text-decoration:none}}.workflow-card{{border-top:4px solid #00b99f}}.flow{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:22px 0 0;padding:0;list-style:none;counter-reset:flow}}.flow li{{position:relative;min-height:142px;padding:15px 13px;border:1px solid #d8e7e5;border-radius:13px;background:linear-gradient(155deg,#f7fcfb,#eef8f6);counter-increment:flow}}.flow li::before{{content:"0" counter(flow);display:block;margin-bottom:18px;color:#00a58e;font-size:11px;font-weight:900;letter-spacing:.08em}}.flow li:not(:last-child)::after{{content:"→";position:absolute;z-index:2;right:-9px;top:66px;width:18px;height:18px;border:1px solid #cae2de;border-radius:50%;background:#fff;color:#008f7a;text-align:center;font-size:12px;line-height:16px}}.flow b{{display:block;margin-bottom:7px;font-size:14px}}.flow small{{display:block;color:#68777a;font-size:11px;line-height:1.55}}.code-name{{display:block;margin-top:8px;color:#087f70;font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}.runtime-strip{{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:8px;margin-top:12px}}.runtime-item{{padding:10px 12px;border-radius:10px;background:#091619;color:#d6e7e7;font-size:11px;line-height:1.5;overflow-wrap:anywhere}}.runtime-item b{{display:block;color:#27d8bd;font-size:10px;letter-spacing:.08em}}.runtime-chain{{margin:12px 0 0;padding:10px 12px;border-radius:10px;background:#e9f7f4;color:#47605d;font-size:11px;line-height:1.6;overflow-wrap:anywhere}}.runtime-chain b{{color:#087f70;margin-right:8px}}.dev-grid{{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-top:14px}}.dev-panel{{border:1px solid #dbe8e8;border-radius:14px;overflow:hidden;background:#fff}}.dev-panel>header{{padding:15px 16px;background:#f5faf9}}.dev-panel h3{{margin:0 0 4px;font-size:16px}}.dev-panel header p{{margin:0;color:#6d797b;font-size:11px;line-height:1.5}}.prompt-stack{{margin:0;padding:6px 16px 14px;list-style:none;counter-reset:layer}}.prompt-stack li{{display:grid;grid-template-columns:26px 1fr;gap:8px;padding:9px 0;border-bottom:1px solid #edf3f2;counter-increment:layer}}.prompt-stack li:last-child{{border-bottom:0}}.prompt-stack li::before{{content:counter(layer);display:flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:6px;background:#e5f6f3;color:#008a76;font-size:10px;font-weight:900}}.prompt-stack b{{font-size:12px}}.prompt-stack span{{display:block;margin-top:3px;color:#6d797b;font-size:10px;line-height:1.5}}.branch-list{{margin:0;padding:7px 16px 15px;list-style:none}}.branch-list li{{padding:10px 0;border-bottom:1px solid #edf3f2;font-size:11px;line-height:1.55}}.branch-list li:last-child{{border-bottom:0}}.branch-list b{{display:block;margin-bottom:2px;color:#0b7567;font-size:12px}}.formula{{margin:0 16px 16px;padding:11px 12px;border-radius:10px;background:#071114;color:#d8e9e8;font:10px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}}details.tech-detail{{min-width:0;margin-top:14px;border:1px solid #dbe8e8;border-radius:14px;background:#fff;overflow:hidden}}details.tech-detail>summary{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 16px;background:#f5faf9;cursor:pointer;font-size:14px;font-weight:800}}details.tech-detail>summary small{{color:#718083;font-size:11px;font-weight:500}}.table-wrap{{max-width:100%;overflow-x:auto}}table{{width:100%;border-collapse:collapse;font-size:11px}}th,td{{padding:11px 12px;border-top:1px solid #e4eeec;text-align:left;vertical-align:top;line-height:1.55}}th{{background:#fbfdfd;color:#506063;font-size:10px;letter-spacing:.05em;white-space:nowrap}}td:first-child{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#087465;white-space:nowrap}}.callout{{margin:14px 0 0;padding:12px 14px;border-left:4px solid #00ad94;border-radius:8px;background:#edf9f7;color:#47605d;font-size:12px;line-height:1.65}}.dev-grid>*,.channel-grid>*,.channel-grid>.card{{min-width:0}}.channel-grid{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px}}.channel-grid>.card{{height:max-content}}@media(max-width:980px){{.flow{{grid-template-columns:repeat(3,minmax(0,1fr))}}.flow li:nth-child(3)::after{{display:none}}.runtime-strip{{grid-template-columns:1fr 1fr}}.dev-grid,.channel-grid{{grid-template-columns:minmax(0,1fr)}}}}@media(max-width:700px){{.wrap{{margin-top:24px;padding:0 14px 40px}}h1{{font-size:30px}}.hero,.card{{padding:20px}}.status,.flow,.runtime-strip{{grid-template-columns:minmax(0,1fr)}}.flow li{{min-height:auto}}.flow li::after{{display:none!important}}.section-head{{display:block}}.doc-link{{margin-top:14px}}details.tech-detail>summary{{display:block}}details.tech-detail>summary small{{display:block;margin-top:5px}}.table-wrap{{overflow:visible}}table,thead,tbody,tr,th,td{{display:block;width:100%}}thead{{display:none}}tr{{padding:9px 12px;border-top:1px solid #e4eeec}}td,td:first-child{{display:grid;grid-template-columns:82px minmax(0,1fr);gap:8px;padding:3px 0;border:0;white-space:normal;overflow-wrap:anywhere}}td::before{{color:#718083;font:9px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}}td:nth-child(1)::before{{content:"参数"}}td:nth-child(2)::before{{content:"来源 / 默认"}}td:nth-child(3)::before{{content:"作用"}}td:nth-child(4)::before{{content:"校验 / 兼容"}}button.secondary{{margin-left:0}}}}
-    </style></head><body><div class="wrap"><section class="hero"><div style="font-size:12px;letter-spacing:.16em;color:#12d8bb;font-weight:800">ONE-CLICK LOCAL SERVICE</div><h1>三笙 · 电商商品分析引擎 V{SERVER_VERSION}</h1><div class="sub">单商品手动深采；类目不限，参数与SKU动态识别，评论可持续采集，也可随时基于当前数据开始分析。</div></section>
+    </style></head><body><div class="wrap"><section class="hero"><div style="font-size:12px;letter-spacing:.16em;color:#12d8bb;font-weight:800">商品分析 · 新品设计</div><h1>三笙 · 商品分析</h1><div class="sub">单商品手动深采；类目不限，参数与SKU动态识别，评论可持续采集，也可随时基于当前数据开始分析。</div></section>
     <section class="card"><div class="status"><div class="pill">本地服务<br><span class="ok">运行正常 · V{SERVER_VERSION}</span></div><div class="pill">分析模型<br><span class="{'ok' if is_cfg else 'bad'}">{'已配置 '+model if is_cfg else '待配置'}</span></div><div class="pill">生图模型<br><span class="{'ok' if image_ok else 'bad'}">{'已配置 '+image_model if image_cfg else '待配置'}</span></div></div></section>
-    <section class="card workflow-card" id="image-workflow"><div class="section-head"><div><span class="eyebrow">ENGINEERING MAP · REAL RUNTIME</span><h2>生图工作流 · 研发速览</h2><p>弹窗只读取默认图位并本地编辑要求；确认提交后，后台解析用户意图一次、组装逐图提示词，再调用生图接口并逐张保存。Demo 未接入积分计费与余额校验。</p></div><a class="doc-link" href="/prompts">查看 / 编辑提示词模板 →</a></div><p class="runtime-chain"><b>前端触发链</b><code>initPlanActions</code> → <code>/api/image-generation-setup</code> → <code>/api/generate-images</code> → <code>pollJob</code>；后台按槽位调用 <code>image_generate</code>，逐张写入 manifest。</p>
-    <ol class="flow"><li><b>读取报告与方案</b><small>从报告文件或请求体读取真实商品事实，按 <code>planIndex</code> 选择“下一款方向”。</small><span class="code-name">_load_report_for_generation</span></li><li><b>拆成逐图任务</b><small>提供主图 5 位、详情图 15 位；弹窗默认选择主图 5 位 + 详情前 6 位。</small><span class="code-name">build_generation_slots</span></li><li><b>确定起始产品基准</b><small>用户上传最多 4 张优先；否则取采集到的第一张商品主图。明确的用户商品设定可覆盖对应字段。</small><span class="code-name">resolve_reference_images</span></li><li><b>组装与校验提示词</b><small>注入身份锁、报告参数、用户最终设定、方案、单图任务和禁区；视觉要求再按槽位相关性分配。</small><span class="code-name">build_image_prompt + merge_image_prompt_with_user_edit</span></li><li><b>调用生图渠道</b><small>把最终 prompt、模型、尺寸、数量和参考图发给 OpenAI-compatible 接口。</small><span class="code-name">image_generate</span></li><li><b>落盘与一致性复核</b><small>兼容 URL / Base64 返回；每完成一张即保存图片与任务清单，最后标记人工复核。</small><span class="code-name">_persist_image_job + consistencyGate</span></li></ol>
-    <div class="runtime-strip"><div class="runtime-item"><b>当前真实端点</b>{image_endpoint}</div><div class="runtime-item"><b>渠道选择</b>{html.escape(image_channel_label)}</div><div class="runtime-item"><b>固定出图尺寸</b>主图 1024×1024<br>详情图 1024×1536</div><div class="runtime-item"><b>单任务与容错</b>每槽位 n=1<br>超时 {request_timeout}s · 重试 {request_retries} 次</div></div>
-    <div class="dev-grid"><section class="dev-panel"><header><h3>最终提示词怎样组成</h3><p>这是实际拼装顺序，不展示模型的隐藏推理过程。</p></header><ol class="prompt-stack"><li><div><b>统一产品身份锁 <code>identityLock</code></b><span>报告商品与参数作为默认基准；全局明确商品修改写入 <code>productOverrides</code>，整套图共享同一最终 identityId。</span></div></li><li><div><b>参考图规则</b><span>uploaded / collected / fission 决定起始外观；用户明确指定的商品字段优先覆盖参考图对应默认字段。</span></div></li><li><div><b>全局用户方向</b><span>明确的材质、颜色、结构、规格等商品设定作用于整套图；视觉要求按槽位相关性分配；品牌、交易、认证等禁区被拦截。</span></div></li><li><div><b>开品方案与爆款表达</b><span>注入方案名称、产品动作、页面动作；只借鉴高转化表达方法，不复制竞品。</span></div></li><li><div><b>当前图片默认任务</b><span>注入 assetType、index、role、task 与 handoff；用户没有明确覆盖时，继续执行本图默认信息任务。</span></div></li><li><div><b>事实、视觉与构图约束</b><span>类目、受众、页面实采参数提供默认值；视觉信号、尺寸和平台硬性禁区共同收口。</span></div></li><li><div><b>模板包裹与单图编辑 <code>promptMerge</code></b><span><code>image_generation</code> 用 <code>{{prompt}}</code> 注入内置提示词；商品字段编辑直接提权，视觉编辑需与本图相关，不相关内容保留默认策划。</span></div></li></ol><p class="formula">basePrompt → image_generation.replace("{{prompt}}", basePrompt) → relevanceGuard(promptOverride) → finalPrompt</p></section>
-    <section class="dev-panel"><header><h3>参考图与并发分支</h3><p>是否上传参考图和“裂变花型”开关决定执行 DAG。</p></header><ul class="branch-list"><li><b>上传参考图</b>第一张作为商品身份基准；“产品展示与参考图拍摄一致”开启时，采集商品对应槽位图负责机位、构图、动作和摆放状态，上传图不再决定视角。</li><li><b>未上传 · 普通同款</b>采集商品第一张主图作为共同起始参考，已选槽位可并行生成。</li><li><b>未上传 · 裂变花型</b>先串行生成 <code>main:1</code> 新品基准图，再把该结果作为其余槽位的共同参考并行生成。</li><li><b>没有任何可用参考图</b>预览和正式任务都会立即报错，不会无产品基准盲生图。</li><li><b>结果复核</b>系统记录共享身份设定、参考角色（<code>referenceRole</code>）和使用数量（<code>referenceCountUsed</code>），但不等于视觉质检通过；发布前仍需人工核对结构、颜色、材质、规格、文字与合规。</li></ul></section></div>
-    <details class="tech-detail" open><summary>业务请求参数 <small>报告弹窗 → /api/image-prompt-preview 与 /api/generate-images</small></summary><div class="table-wrap"><table><thead><tr><th>参数</th><th>来源 / 默认</th><th>作用</th><th>校验与边界</th></tr></thead><tbody><tr><td>source / reportData</td><td>当前报告 URL 或报告 JSON</td><td>提供商品事实、证据账本、视觉分析和开品方案。</td><td>source 只能读取本地 reports 目录内的 JSON。</td></tr><tr><td>planIndex</td><td>用户选择；默认 0</td><td>决定本次执行哪一个新品方案。</td><td>必须落在实际方案数组范围内。</td></tr><tr><td>assetTypes</td><td>main / detail</td><td>决定生成主图、详情图或两者。</td><td>其他值被过滤；正式生成至少保留一种。</td></tr><tr><td>selectedSlots</td><td>例如 main:1、detail:3</td><td>精确选择要执行的图片槽位。</td><td>空值代表执行所选类型的全部槽位。</td></tr><tr><td>referenceImages</td><td>用户上传；最多 4 张</td><td>提供真实起始商品外观，不只是写进文字提示词。</td><td>用户明确商品设定可覆盖对应默认字段；单张上传限制约 9 MB。</td></tr><tr><td>matchReferenceShooting</td><td>默认 false（未勾选）</td><td>true 时继承参考图拍摄语言：机位、景别、透视、构图、背景、光线、姿态、陈列与留白；false 时仅锁定产品身份，按当前槽位业务目标重新设计拍摄。</td><td>只影响视觉表达；平台合规、identityLock、方案产品目标和当前槽位业务目标优先，首张 main:1 仍冻结未明确修改的商品字段。</td></tr><tr><td>userDirection</td><td>全局最终要求</td><td>既可指定商品字段，也可调整场景、构图、镜头和排版。</td><td>商品设定应用整套图；视觉要求再按槽位相关性分配；平台禁区拦截。</td></tr><tr><td>promptOverrides</td><td>按槽位保存的单图编辑</td><td>让某张图优先执行明确商品修改或相关视觉要求。</td><td>商品字段可覆盖本图默认值；视觉编辑需相关；平台禁区始终不能覆盖。</td></tr><tr><td>fissionPattern</td><td>未上传时默认开启</td><td>先产出新品基准，再保持整套裂变商品一致。</td><td>上传参考图时强制关闭。</td></tr><tr><td>completeSet</td><td>默认 true</td><td>按已计算的槽位任务生成，而非简单重复 n 张。</td><td>true 且 selectedSlots 为空时执行所选类型的全部槽位。</td></tr><tr><td>jobId / statusUrl</td><td>POST 成功返回</td><td>异步任务标识与轮询地址。</td><td>客户端按 statusUrl 查询，不阻塞当前请求。</td></tr><tr><td>GET status</td><td>/api/image-job/&lt;jobId&gt;</td><td>返回 status、progress、results、error 和 consistencyGate。</td><td>queued / generating / complete / error；完成后结果可追溯。</td></tr></tbody></table></div></details>
-    <details class="tech-detail" open><summary>生图接口参数与返回 <small>服务端 → 当前生图 API；密钥不会显示在页面</small></summary><div class="table-wrap"><table><thead><tr><th>参数</th><th>当前值 / 默认</th><th>作用</th><th>兼容策略</th></tr></thead><tbody><tr><td>model</td><td>{image_model or '未配置'}</td><td>真正写入生图请求体的模型 ID。</td><td>必填；与分析模型完全独立。</td></tr><tr><td>image_models_path</td><td>{image_models_path}</td><td>保存/测试连接时查询生图模型列表的路径。</td><td>默认 <code>/models</code>；与实际出图路径分开。</td></tr><tr><td>prompt</td><td>按上方 7 层动态组成</td><td>每张图都得到不同的最终提示词。</td><td>预览接口与正式生成共用同一拼装函数。</td></tr><tr><td>size</td><td>main 1024×1024<br>detail 1024×1536</td><td>按主图 / 详情图用途固定画布比例。</td><td>由槽位类型决定，不使用页面自由输入覆盖。</td></tr><tr><td>n</td><td>1</td><td>一次接口调用只生成当前槽位的一张图。</td><td>整套数量由 selectedSlots 决定。</td></tr><tr><td>image / reference_images / images</td><td>同一组参考图的兼容字段</td><td>把真实产品图随请求发送给生图服务。</td><td>按三种常见字段形态逐一尝试，不能静默丢弃参考图。</td></tr><tr><td>quality / style</td><td>{image_quality or '服务商默认'} / {html.escape(str(c.get('image_style') or '服务商默认'))}</td><td>quality 控制图片质量；style 保留供应商风格提示。</td><td>配置页提供默认质量；报告弹窗可按模型覆盖 quality。接口拒绝可选字段时自动移除后重试。</td></tr><tr><td>response.data[]</td><td>URL 或 Base64</td><td>读取 url、image_url、b64_json 或 base64。</td><td>校验确为图片后保存到 generated/&lt;jobId&gt;/。</td></tr><tr><td>job manifest</td><td>每张图完成即写入</td><td>保存 prompt、slot、方案、identityLock 与结果地址。</td><td>服务重启后已完成图片仍可追溯，未完成项提示重提。</td></tr><tr><td>consistencyGate</td><td>完成时为 needs_review</td><td>记录整套图共享身份与约束后的复核状态。</td><td>不是视觉质检通过；正式发布前仍需人工检查。</td></tr></tbody></table></div></details>
-    <p class="callout"><b>优先级一句话：</b>平台合规 ＞ 用户明确商品设定与 identityLock ＞ 方案产品目标 ＞ 当前槽位业务目标 ＞（勾选时）参考图拍摄语言 ＞ 默认构图；拍摄一致只影响视觉表达，不覆盖业务/产品目标，未明确修改的商品字段继续沿用参考基准。</p></section>
     <div class="channel-grid"><section class="card"><h2 style="margin-top:0">分析渠道</h2><p style="color:#667067">负责提炼商品事实、生成报告与新品方案；不直接输出图片。</p>
-    <label>分析 API Base</label><input id="base" value="{base}"><small class="field-help">OpenAI-compatible 文本模型服务根地址；服务端会拼接 <code>/models</code> 和 <code>/chat/completions</code>。</small><label>分析 API Key（{key_state}）</label><input id="key" type="password" placeholder="粘贴新的 Key；已保存时可留空"><small class="field-help">仅保存在本机配置文件中；留空表示继续使用已保存值，页面不会回显密钥。</small><label>分析模型（必填）</label><input id="model" value="{model}" placeholder="例如 qwen3.7-flash"><small class="field-help">用于七角色商品分析和结构化报告，不会代替下方生图模型。</small></section>
-    <section class="card"><h2 style="margin-top:0">生图渠道</h2><p style="color:#667067">负责主图和详情图，可使用与分析渠道不同的服务商、Key 和模型；API Base 与 Key 未单独配置时，各字段分别复用分析渠道。</p>
-    <label>生图 API Base</label><input id="imageBase" value="{image_base}" placeholder="例如 https://example.com/v1；未配置时复用分析 API Base"><small class="field-help">生图服务根地址；配置值为空时继承“分析 API Base”。当前实际模式：<b>{html.escape(image_channel_label)}</b>。</small><label>生图 API Key（{image_key_state}）</label><input id="imageKey" type="password" placeholder="粘贴生图渠道 Key；已保存时可留空"><small class="field-help">未保存独立 Key 时继承分析 Key；若上方标记“已单独保存”，输入框留空表示继续使用已保存值。页面永不回显密钥。</small><label>默认生图模型（必填）</label><input id="imageModel" value="{image_model}" placeholder="例如 qwen-image-3.0"><small class="field-help">兼容旧流程；同时作为对比测试的默认模型。</small><label>默认图片质量</label><select id="imageQuality">{quality_options}</select><small class="field-help">留空使用服务商默认。建议模型对比时统一选择 <code>medium</code>，避免把模型差异和质量差异混在一起。</small><label>生图测试模型列表</label><textarea id="imageModels" placeholder="每行一个模型 ID">{image_models_text}</textarea><small class="field-help">每行一个模型 ID。报告弹窗会按这些模型提供复选框，并以“模型列 × 图片任务行”展示对比结果；每个模型还可单独选择质量。</small><label>生图接口路径</label><input id="imagePath" value="{image_path}"><small class="field-help">拼接在实际 API Base 后；默认 <code>/images/generations</code>。当前完整端点：<code>{image_endpoint}</code>。</small>
-    <button onclick="save()">保存并测试连接</button><button class="secondary" onclick="test()">仅重新测试</button><div id="msg" role="status" aria-live="polite">{'配置错误：'+cfg_err if cfg_err else ('API错误：'+probe if (is_cfg and not api_ok and probe) else '')}</div></section></div>
-    <section class="card"><h2 style="margin-top:0">提示词与业务联动</h2><p>查看当前模板原文、变量说明和真实模型联动。<code>image_generation</code> 模板必须保留 <code>{{prompt}}</code>，保存后下一次预览与正式生图立即生效。</p><p><a href="/prompts">打开提示词与模型联动配置 →</a></p></section>
-    <section class="card"><h2 style="margin-top:0">下一步</h2><p>Chrome 只需加载一次 <code>extension</code> 文件夹。之后每次使用：双击启动 → 打开已登录的天猫商品页 → 可选导入监测数据 → 点击扩展“开始深度采集”。</p></section></div>
+    <label>分析 API Base</label><input id="base" value="{base}"><small class="field-help">填写模型服务商提供的 API 地址。</small><label>分析 API Key（{key_state}）</label><label><input id="editAnalysisKey" type="checkbox" style="width:auto" onchange="document.getElementById('key').disabled=!this.checked"> 修改分析密钥</label><input id="key" name="analysis-provider-secret" type="password" autocomplete="new-password" disabled placeholder="开启修改后填写分析密钥"><small class="field-help">仅保存在本机配置文件中；留空表示继续使用已保存值，页面不会回显密钥。</small><label>分析模型（必填）</label><input id="model" value="{model}" placeholder="例如 qwen3.7-flash"><small class="field-help">用于七角色商品分析和结构化报告，不会代替下方生图模型。</small></section>
+    <section class="card"><h2 style="margin-top:0">生图渠道</h2><p style="color:#667067">负责主图和详情图。服务地址、密钥和模型独立配置。</p>
+    <label>生图 API Base</label><input id="imageBase" value="{image_base}" placeholder="例如 https://example.com/v1"><small class="field-help">填写生图服务商提供的 API 地址。</small><label>生图 API Key（{image_key_state}）</label><label><input id="editImageKey" type="checkbox" style="width:auto" onchange="document.getElementById('imageKey').disabled=!this.checked"> 修改生图密钥</label><input id="imageKey" name="image-provider-secret" type="password" autocomplete="new-password" disabled placeholder="开启修改后填写生图密钥"><small class="field-help">仅用于生图；不与分析渠道共用。未修改时保留已保存值。</small><label>默认生图模型（必填）</label><input id="imageModel" value="{image_model}" placeholder="例如 qwen-image-3.0"><small class="field-help">用于生成商品主图和详情图。</small><label>默认图片质量</label><select id="imageQuality">{quality_options}</select><small class="field-help">留空使用服务商默认。建议模型对比时统一选择 <code>medium</code>，避免把模型差异和质量差异混在一起。</small><label>可选生图模型</label><textarea id="imageModels" placeholder="每行一个模型 ID">{image_models_text}</textarea><small class="field-help">每行一个模型 ID。报告弹窗会按这些模型提供复选框，并以“模型列 × 图片任务行”展示对比结果；每个模型还可单独选择质量。</small><details style="margin-top:16px"><summary>高级设置</summary><label>生图接口路径</label><input id="imagePath" value="{image_path}"><small class="field-help">通常保持默认值；服务商有特殊要求时再修改。</small></details>
+    <button onclick="save()">保存并测试连接</button><button class="secondary" onclick="test()">仅重新测试</button><div id="msg" role="status" aria-live="polite">{'配置文件无法读取，请检查本地配置。' if cfg_err else (probe if (is_cfg and not api_ok and probe) else '')}</div></section></div>
+    <section class="card"><h2 style="margin-top:0">下一步</h2><p>Chrome 只需加载一次 <code>extension</code> 文件夹。之后每次使用：双击启动 → 打开已登录的天猫商品页 → 点击扩展“开始深度采集”。</p></section></div>
     <script>
-    async function save(){{const msg=document.getElementById('msg');if(!model.value.trim()||!imageModel.value.trim()){{msg.textContent='✕ 分析模型和默认生图模型都必须填写。';return}}msg.textContent='正在保存并分别测试两个渠道…';const r=await fetch('/api/config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{api_base:base.value,api_key:key.value,model:model.value,image_api_base:imageBase.value,image_api_key:imageKey.value,image_model:imageModel.value,image_quality:document.getElementById('imageQuality').value,image_models:imageModels.value.split(/[,\\n]/).map(x=>x.trim()).filter(Boolean),image_path:imagePath.value}})}});const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道和生图渠道均已保存并验证。':'✕ '+(d.error||'配置失败');if(d.ok)setTimeout(()=>location.reload(),700)}}
-    async function test(){{const msg=document.getElementById('msg');msg.textContent='正在分别测试两个渠道…';const r=await fetch('/api/model-test');const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道：'+(d.analysis?.model||'')+'；生图渠道：'+(d.image?.imageModel||'')+(d.image?.separateChannel?'（独立渠道）':'（复用分析渠道）'):'✕ '+(d.error||'连接失败')}}
+    function connectionMessage(error){{const text=String(error||'').toLowerCase();if(text.includes('生图渠道的模型列表中未找到')||text.includes('生图服务未提供'))return String(error);if(/invalid_api_key|incorrect api key|unauthorized|401/.test(text))return '密钥验证失败，请检查 API Key 是否正确。';if(/timeout|timed out|超时/.test(text))return '连接超时，请稍后重试。';if(/429|rate_limit|quota|余额|额度/.test(text))return '服务暂时受限，请检查账户额度或稍后重试。';return '连接失败，请检查服务地址、密钥和模型设置。';}}
+    async function save(){{const msg=document.getElementById('msg');if(!model.value.trim()||!imageModel.value.trim()){{msg.textContent='✕ 分析模型和默认生图模型都必须填写。';return}}if((document.getElementById('editAnalysisKey').checked&&!document.getElementById('key').value.trim())||(document.getElementById('editImageKey').checked&&!document.getElementById('imageKey').value.trim())){{msg.textContent='请填写要修改的密钥，或取消修改。';return}}msg.textContent='正在保存并分别测试两个渠道…';const r=await fetch('/api/config',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{api_base:base.value,api_key:document.getElementById('editAnalysisKey').checked?document.getElementById('key').value:undefined,model:model.value,image_api_base:imageBase.value,image_api_key:document.getElementById('editImageKey').checked?document.getElementById('imageKey').value:undefined,image_model:imageModel.value,image_quality:document.getElementById('imageQuality').value,image_models:imageModels.value.split(/[,\\n]/).map(x=>x.trim()).filter(Boolean),image_path:imagePath.value}})}});const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道和生图渠道均已保存并验证。':(d.saved?'配置已保存，连接验证未通过：':'保存失败：')+connectionMessage(d.error);if(d.ok)setTimeout(()=>location.reload(),700)}}
+    async function test(){{const msg=document.getElementById('msg');msg.textContent='正在分别测试两个渠道…';const r=await fetch('/api/model-test');const d=await r.json();msg.textContent=d.ok?'✓ 分析渠道：'+(d.analysis?.model||'')+'；生图渠道：'+(d.image?.imageModel||'')+(d.image?.separateChannel?'（独立渠道）':'（复用分析渠道）'):'✕ '+connectionMessage(d.error)}}
     </script></body></html>'''
 
 def prompt_page():
@@ -2456,15 +2492,15 @@ class H(BaseHTTPRequestHandler):
                 n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n).decode('utf-8') or '{}')
                 save_config(data)
                 MODEL_PROBE=probe_model_api(timeout=18); MODEL_PROBE_AT=time.time()
-                if not MODEL_PROBE.get('ok'): self.send_json({'ok':False,'error':MODEL_PROBE.get('error') or 'API连接失败','probe':MODEL_PROBE},400); return
+                if not MODEL_PROBE.get('ok'): self.send_json({'ok':False,'error':MODEL_PROBE.get('error') or 'API连接失败','probe':MODEL_PROBE,'saved':True},400); return
                 c=load_config()
                 if not c.get('image_model'): self.send_json({'ok':False,'error':'生图模型为必填项'},400); return
                 image_probe=probe_image_api(timeout=18)
-                if not image_probe.get('ok'): self.send_json({'ok':False,'error':'生图渠道连接失败：'+str(image_probe.get('error') or ''),'analysis':MODEL_PROBE,'image':image_probe},400); return
+                if not image_probe.get('ok'): self.send_json({'ok':False,'error':'生图渠道连接失败：'+str(image_probe.get('error') or ''),'analysis':MODEL_PROBE,'image':image_probe,'saved':True},400); return
                 if image_probe.get('allImageModelsFound') is False:
                     missing=', '.join(item['id'] for item in image_probe.get('imageModels',[]) if item.get('found') is False)
-                    self.send_json({'ok':False,'error':'生图渠道的模型列表中未找到 '+missing,'analysis':MODEL_PROBE,'image':image_probe},400); return
-                self.send_json({'ok':True,'model':c.get('model'),'imageModel':c.get('image_model'),
+                    self.send_json({'ok':False,'error':'生图渠道的模型列表中未找到 '+missing,'analysis':MODEL_PROBE,'image':image_probe,'saved':True},400); return
+                self.send_json({'ok':True,'saved':True,'model':c.get('model'),'imageModel':c.get('image_model'),
                                 'imageModels':image_probe.get('imageModels') or image_model_options(c),
                                 'analysis':MODEL_PROBE,'image':image_probe}); return
             except Exception as e: self.send_json({'ok':False,'error':str(e)},400); return
@@ -2686,7 +2722,7 @@ class H(BaseHTTPRequestHandler):
         if p=='/api/model-test':
             MODEL_PROBE=probe_model_api(timeout=18); MODEL_PROBE_AT=time.time(); image_probe=probe_image_api(timeout=18)
             ok=bool(MODEL_PROBE.get('ok') and image_probe.get('ok') and image_probe.get('allImageModelsFound') is not False)
-            self.send_json({'ok':ok,'analysis':MODEL_PROBE,'image':image_probe,'error':(MODEL_PROBE.get('error') or image_probe.get('error')) if not ok else None},200 if ok else 502); return
+            self.send_json({'ok':ok,'analysis':MODEL_PROBE,'image':image_probe,'error':model_test_message(MODEL_PROBE,image_probe) if not ok else None},200 if ok else 502); return
         if p.startswith('/api/monitor/'):
             item_id=p.rsplit('/',1)[-1]; mp=monitor_path(item_id).with_suffix('.json')
             if not mp.exists(): self.send_json({'ok':True,'days':0}); return
@@ -2737,13 +2773,20 @@ class H(BaseHTTPRequestHandler):
             self.send_json(job if job else {'error':'image job not found'},200 if job else 404); return
         if p=='/api/image-jobs':
             source=(parse_qs(urlparse(self.path).query).get('source') or [''])[0]
-            jobs={k:dict(v) for k,v in IMAGE_JOBS.items()}
+            jobs={k:image_history_summary(v) for k,v in IMAGE_JOBS.items()}
             # Checkpoints are named generated_<jobId>.json. Keep persisted
             # history visible after a local service restart as well as in-memory
             # jobs created by the current process.
             for saved in REPORTS.glob('generated_*.json'):
                 try:
-                    item=json.loads(saved.read_text('utf-8'))
+                    job_id=saved.stem.removeprefix('generated_')
+                    if job_id in jobs: continue
+                    index=REPORTS/'.image-history'/f'{job_id}.json'
+                    if index.exists() and index.stat().st_mtime_ns>=saved.stat().st_mtime_ns:
+                        item=json.loads(index.read_text('utf-8'))
+                    else:
+                        item=image_history_summary(json.loads(saved.read_text('utf-8')))
+                        _write_history_summary(job_id,item)
                     if isinstance(item,dict) and item.get('jobId'): jobs[item['jobId']]=item
                 except Exception: pass
             records=[x for x in jobs.values() if not source or x.get('reportSource')==source]
